@@ -1,15 +1,12 @@
-#[macro_use]
-extern crate lazy_static;
 use actix_web::http::StatusCode;
 use actix_web::{get, web, App, HttpResponse, HttpServer, Responder, ResponseError};
-use dns_lookup::lookup_host;
-use ipnetwork::Ipv4Network;
-use reqwest::Client;
+use ipnetwork::{Ipv4Network, Ipv6Network};
+use mime::Mime;
+use reqwest::{header::CONTENT_TYPE, Client};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr};
-use url::{Host, Url, ParseError};
+use url::{Host, ParseError, Url};
 use validator::Validate;
-//use mime::Mime;
 
 fn blacklisted_ipv4networks() -> impl Iterator<Item = Ipv4Network> {
     std::iter::empty()
@@ -27,25 +24,41 @@ fn blacklisted_ipv4networks() -> impl Iterator<Item = Ipv4Network> {
         ))
 }
 
+fn blacklisted_ipv6networks() -> impl Iterator<Item = Ipv6Network> {
+    //TODO blacklist private networks etc.
+    std::iter::empty::<Ipv6Network>()
+}
+
+struct AppState {
+    client: Client,
+}
+
 #[derive(Serialize, Debug)]
 pub enum ProxyError {
     RequestFailed,
     ForbiddenProxy,
     CouldNotResolve,
+    BadContentType,
+    MissingContentType,
+    UnsupportedContentType,
+    LabelMe,
 }
 
 impl std::fmt::Display for ProxyError {
     fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!()
+        write!(fmt, "{:?}", self)
     }
 }
 
 impl ResponseError for ProxyError {
     fn status_code(&self) -> StatusCode {
         match *self {
-            ProxyError::RequestFailed => StatusCode::BAD_REQUEST,
-            ProxyError::ForbiddenProxy => StatusCode::BAD_REQUEST,
-            ProxyError::CouldNotResolve => StatusCode::INTERNAL_SERVER_ERROR,
+            ProxyError::RequestFailed
+            | ProxyError::ForbiddenProxy
+            | ProxyError::BadContentType
+            | ProxyError::MissingContentType => StatusCode::BAD_REQUEST,
+            ProxyError::UnsupportedContentType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ProxyError::CouldNotResolve | ProxyError::LabelMe => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
@@ -78,8 +91,13 @@ fn check_addr(addr: IpAddr) -> Result<(), ProxyError> {
             }
             Ok(())
         }
-        IpAddr::V6(_) => {
-            todo!()
+        IpAddr::V6(addr) => {
+            for network in blacklisted_ipv6networks() {
+                if network.contains(addr) {
+                    return Err(ProxyError::ForbiddenProxy);
+                }
+            }
+            Ok(())
         }
     }
 }
@@ -94,30 +112,56 @@ fn check_url(url: &Url) -> Result<(), ProxyError> {
 }
 
 #[get("/proxy")]
-async fn proxy(query: web::Query<Parameters>) -> Result<impl Responder, ProxyError> {
+async fn proxy(
+    state: web::Data<AppState>,
+    query: web::Query<Parameters>,
+) -> Result<impl Responder, ProxyError> {
     //TODO better errors
     let url = Url::parse(&query.into_inner().url)?;
     check_url(&url)?;
 
-    let ips = lookup_host(url.host_str().unwrap())?;
-
-    ips.into_iter().map(check_addr).collect::<Result<_,_>>()?;
-
-    let resp = CLIENT
+    let resp = state
+        .client
         .get(url)
         .send()
         .await
         .map_err(|_| ProxyError::RequestFailed)?;
 
-    Ok(HttpResponse::Ok())
+    let addr = match resp.remote_addr() {
+        Some(addr) => Ok(addr),
+        None => Err(ProxyError::LabelMe),
+    }?;
+    check_addr(addr.ip())?;
+
+    let content_type = resp
+        .headers()
+        .get(CONTENT_TYPE)
+        .ok_or(ProxyError::MissingContentType)?
+        .to_str()
+        .map_err(|_| ProxyError::LabelMe)?;
+
+    let mime: Mime = content_type
+        .parse()
+        .map_err(|_| ProxyError::BadContentType)?;
+
+    match mime.type_() {
+        mime::IMAGE | mime::VIDEO => Ok(HttpResponse::Ok().streaming(resp.bytes_stream())),
+        _ => Err(ProxyError::UnsupportedContentType),
+    }
 }
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     println!("Hello, world!");
 
-    HttpServer::new(|| App::new().service(proxy))
-        .bind(("localhost", 8080))?
-        .run()
-        .await
+    HttpServer::new(|| {
+        App::new()
+            .app_data(web::Data::new(AppState {
+                client: Client::new(),
+            }))
+            .service(proxy)
+    })
+    .bind(("localhost", 8080))?
+    .run()
+    .await
 }

@@ -1,5 +1,5 @@
 [package]
-name = "proxy"
+name = "bouncer"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,11 +7,9 @@ edition = "2021"
 
 [dependencies]
 actix-web = "4.3.0"
-dns-lookup = "1.0.8"
 ipnetwork = "0.20.0"
-lazy_static = "1.4.0"
 mime = "0.3.16"
-reqwest = "0.11.14"
+reqwest = { version = "0.11.14", features = ["stream"] }
 serde = { version = "1.0.152", features = ["derive"] }
 url = "2.3.1"
 validator = { version = "0.16.0", features = ["derive"] }
