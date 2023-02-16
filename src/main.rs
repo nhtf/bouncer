@@ -150,6 +150,25 @@ async fn proxy(
     }
 }
 
+//TODO
+//Add HMAC signing to verify of link
+//Add config and command line options for the following
+//  Max media size
+//  Allowed mime types
+//  Ip
+//  Port
+//  Timeout
+//  SSL
+//  User agent name
+//  Better errors
+//  HMAC key
+//  Additional HTTP headers
+//  Unix socket instead of listen ip
+//  Blacklist networks
+//  Vebose logging?
+//Add command line help
+//Make endpoint filename so it doesn't download as "proxy" but as actual filename (like how discord does it
+//Optional file validation with something like imagemagick etc.?
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     println!("Hello, world!");
