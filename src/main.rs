@@ -169,6 +169,7 @@ async fn proxy(
 //Add command line help
 //Make endpoint filename so it doesn't download as "proxy" but as actual filename (like how discord does it
 //Optional file validation with something like imagemagick etc.?
+//Better logging of errors
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     println!("Hello, world!");
