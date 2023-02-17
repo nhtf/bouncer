@@ -1,36 +1,44 @@
 use actix_web::http::StatusCode;
 use actix_web::{get, web, App, HttpResponse, HttpServer, Responder, ResponseError};
-use ipnetwork::{Ipv4Network, Ipv6Network};
+use clap::Parser;
+use digest::MacError;
+use hex::FromHexError;
+use hmac::{Hmac, Mac};
+use ipnetwork::IpNetwork;
 use mime::Mime;
-use reqwest::{header::CONTENT_TYPE, Client};
+use reqwest::{header::CONTENT_TYPE, header::CONTENT_LENGTH, header::ToStrError, Client};
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv4Addr};
+use sha2::Sha256;
+use std::net::IpAddr;
 use url::{Host, ParseError, Url};
 use validator::Validate;
 
-fn blacklisted_ipv4networks() -> impl Iterator<Item = Ipv4Network> {
-    std::iter::empty()
-        .chain(std::iter::once(
-            Ipv4Network::new(Ipv4Addr::new(127, 0, 0, 0), 8).unwrap(),
-        ))
-        .chain(std::iter::once(
-            Ipv4Network::new(Ipv4Addr::new(169, 254, 0, 0), 16).unwrap(),
-        ))
-        .chain(std::iter::once(
-            Ipv4Network::new(Ipv4Addr::new(10, 0, 0, 0), 8).unwrap(),
-        ))
-        .chain(std::iter::once(
-            Ipv4Network::new(Ipv4Addr::new(172, 16, 0, 0), 12).unwrap(),
-        ))
-}
+type HmacSha256 = Hmac<Sha256>;
 
-fn blacklisted_ipv6networks() -> impl Iterator<Item = Ipv6Network> {
-    //TODO blacklist private networks etc.
-    std::iter::empty::<Ipv6Network>()
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+    #[arg(short, long, help = "HMAC key")]
+    key: String,
+
+    #[arg(short, long, default_value = "0.0.0.0")]
+    listen: String,
+
+    #[arg(short, long, default_value_t = 8080u16)]
+    port: u16,
+
+    #[arg(short, long, default_value_t = 0u64)]
+    max_size: u64,
+
+    #[arg(short, long = "blacklist", default_value = "127.0.0.0/8;169.254.0.0/16;10.0.0.0/8;172.16.0.0/12")]
+    blacklisted_networks: String,
 }
 
 struct AppState {
     client: Client,
+    secret: String,
+    max_size: u64,
+    blacklisted_networks: Vec<IpNetwork>,
 }
 
 #[derive(Serialize, Debug)]
@@ -40,7 +48,11 @@ pub enum ProxyError {
     CouldNotResolve,
     BadContentType,
     MissingContentType,
+    MissingContentLength,
+    BadContentLength,
+    ContentTooLarge,
     UnsupportedContentType,
+    InvalidDigest,
     LabelMe,
 }
 
@@ -56,7 +68,11 @@ impl ResponseError for ProxyError {
             ProxyError::RequestFailed
             | ProxyError::ForbiddenProxy
             | ProxyError::BadContentType
-            | ProxyError::MissingContentType => StatusCode::BAD_REQUEST,
+            | ProxyError::BadContentLength
+            | ProxyError::MissingContentType
+            | ProxyError::InvalidDigest => StatusCode::BAD_REQUEST,
+            ProxyError::MissingContentLength => StatusCode::LENGTH_REQUIRED,
+            ProxyError::ContentTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             ProxyError::UnsupportedContentType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             ProxyError::CouldNotResolve | ProxyError::LabelMe => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -75,50 +91,76 @@ impl From<std::io::Error> for ProxyError {
     }
 }
 
+impl From<MacError> for ProxyError {
+    fn from(_: MacError) -> Self {
+        ProxyError::InvalidDigest
+    }
+}
+
+impl From<FromHexError> for ProxyError {
+    fn from(_: FromHexError) -> Self {
+        ProxyError::InvalidDigest
+    }
+}
+
+impl From<ToStrError> for ProxyError {
+    fn from(_: ToStrError) -> Self {
+        ProxyError::LabelMe
+    }
+}
+
 #[derive(Validate, Deserialize)]
 pub struct Parameters {
     #[validate(url)]
     url: String,
 }
 
-fn check_addr(addr: IpAddr) -> Result<(), ProxyError> {
-    match addr {
-        IpAddr::V4(addr) => {
-            for network in blacklisted_ipv4networks() {
-                if network.contains(addr) {
-                    return Err(ProxyError::ForbiddenProxy);
-                }
-            }
-            Ok(())
-        }
-        IpAddr::V6(addr) => {
-            for network in blacklisted_ipv6networks() {
-                if network.contains(addr) {
-                    return Err(ProxyError::ForbiddenProxy);
-                }
-            }
-            Ok(())
-        }
+fn contains<'a, I>(addr: IpAddr, mut networks: I) -> bool
+where
+    I: Iterator<Item = &'a IpNetwork>,
+{
+    networks.any(|network| network.contains(addr))
+}
+
+fn check_addr<'a, I>(addr: IpAddr, networks: I) -> Result<(), ProxyError>
+where
+    I: Iterator<Item = &'a IpNetwork>,
+{
+    match contains(addr, networks) {
+        false => Ok(()),
+        true => Err(ProxyError::ForbiddenProxy),
     }
 }
 
-fn check_url(url: &Url) -> Result<(), ProxyError> {
+fn check_url<'a, I>(url: &Url, networks: I) -> Result<(), ProxyError>
+where
+    I: Iterator<Item = &'a IpNetwork>,
+{
     match url.host() {
         Some(Host::Domain(_)) => Ok(()),
-        Some(Host::Ipv4(addr)) => check_addr(IpAddr::V4(addr)),
-        Some(Host::Ipv6(addr)) => check_addr(IpAddr::V6(addr)),
+        Some(Host::Ipv4(addr)) => check_addr(IpAddr::V4(addr), networks),
+        Some(Host::Ipv6(addr)) => check_addr(IpAddr::V6(addr), networks),
         None => todo!(),
     }
 }
 
-#[get("/proxy")]
+#[get("/{digest}/proxy")]
 async fn proxy(
     state: web::Data<AppState>,
+    path: web::Path<String>,
     query: web::Query<Parameters>,
 ) -> Result<impl Responder, ProxyError> {
     //TODO better errors
     let url = Url::parse(&query.into_inner().url)?;
-    check_url(&url)?;
+
+    //Check if url is not blacklisted
+    check_url(&url, state.blacklisted_networks.iter())?;
+
+    //Verify digest
+    //Unwrap should never fail since it also has been tested in main
+    let mut mac = HmacSha256::new_from_slice(state.secret.as_bytes()).unwrap();
+    mac.update(url.as_str().as_bytes());
+    mac.verify_slice(&hex::decode(path.into_inner().as_bytes())?)?;
 
     let resp = state
         .client
@@ -131,14 +173,28 @@ async fn proxy(
         Some(addr) => Ok(addr),
         None => Err(ProxyError::LabelMe),
     }?;
-    check_addr(addr.ip())?;
 
-    let content_type = resp
-        .headers()
+    //Check if resolved address is not blacklisted
+    if contains(addr.ip(), state.blacklisted_networks.iter()) {
+        return Err(ProxyError::ForbiddenProxy);
+    }
+
+    let headers = resp.headers();
+    let content_type = headers 
         .get(CONTENT_TYPE)
         .ok_or(ProxyError::MissingContentType)?
-        .to_str()
-        .map_err(|_| ProxyError::LabelMe)?;
+        .to_str()?;
+
+    let content_length: u64 = headers
+        .get(CONTENT_LENGTH)
+        .ok_or(ProxyError::MissingContentLength)?
+        .to_str()?
+        .parse()
+        .map_err(|_| ProxyError::BadContentLength)?;
+
+    if state.max_size != 0 && content_length < state.max_size {
+        return Err(ProxyError::ContentTooLarge);
+    }
 
     let mime: Mime = content_type
         .parse()
@@ -151,12 +207,8 @@ async fn proxy(
 }
 
 //TODO
-//Add HMAC signing to verify of link
 //Add config and command line options for the following
-//  Max media size
 //  Allowed mime types
-//  Ip
-//  Port
 //  Timeout
 //  SSL
 //  User agent name
@@ -172,16 +224,24 @@ async fn proxy(
 //Better logging of errors
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    println!("Hello, world!");
+    let args = Args::parse();
 
-    HttpServer::new(|| {
+    HmacSha256::new_from_slice(args.key.as_bytes()).expect("Invalid key length");
+
+    HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(AppState {
                 client: Client::new(),
+                secret: args.key.clone(),
+                max_size: args.max_size,
+                blacklisted_networks: args.blacklisted_networks
+                    .split(';')
+                    .map(|network| network.trim().parse().expect("Expected valid CIDR network"))
+                    .collect(),
             }))
             .service(proxy)
     })
-    .bind(("localhost", 8080))?
+    .bind((args.listen, args.port))?
     .run()
     .await
 }
