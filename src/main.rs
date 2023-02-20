@@ -74,6 +74,7 @@ pub enum ProxyError {
     ContentTooLarge,
     UnsupportedContentType,
     InvalidDigest,
+    NoHost,
     LabelMe,
 }
 
@@ -86,16 +87,11 @@ impl std::fmt::Display for ProxyError {
 impl ResponseError for ProxyError {
     fn status_code(&self) -> StatusCode {
         match *self {
-            ProxyError::RequestFailed
-            | ProxyError::ForbiddenProxy
-            | ProxyError::BadContentType
-            | ProxyError::BadContentLength
-            | ProxyError::MissingContentType
-            | ProxyError::InvalidDigest => StatusCode::BAD_REQUEST,
             ProxyError::MissingContentLength => StatusCode::LENGTH_REQUIRED,
             ProxyError::ContentTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             ProxyError::UnsupportedContentType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             ProxyError::LabelMe => StatusCode::INTERNAL_SERVER_ERROR,
+            _ => StatusCode::BAD_REQUEST,
         }
     }
 
@@ -110,6 +106,7 @@ impl ResponseError for ProxyError {
             ProxyError::MissingContentLength => "Response is missing the Content-Length header",
             ProxyError::ContentTooLarge => "Response body is too large to proxy",
             ProxyError::UnsupportedContentType => "Will not proxy Content-Type",
+            ProxyError::NoHost => "No host specified",
             ProxyError::LabelMe => "Internal server error",
         };
         HttpResponse::build(self.status_code())
@@ -123,29 +120,10 @@ impl ResponseError for ProxyError {
     }
 }
 
-impl From<ParseError> for ProxyError {
-    fn from(_: ParseError) -> Self {
-        ProxyError::ForbiddenProxy
-    }
-}
-
-impl From<MacError> for ProxyError {
-    fn from(_: MacError) -> Self {
-        ProxyError::InvalidDigest
-    }
-}
-
-impl From<FromHexError> for ProxyError {
-    fn from(_: FromHexError) -> Self {
-        ProxyError::InvalidDigest
-    }
-}
-
-impl From<ToStrError> for ProxyError {
-    fn from(_: ToStrError) -> Self {
-        ProxyError::LabelMe
-    }
-}
+into_proxy_error!(ParseError, ProxyError::ForbiddenProxy);
+into_proxy_error!(MacError, ProxyError::InvalidDigest);
+into_proxy_error!(FromHexError, ProxyError::InvalidDigest);
+into_proxy_error!(ToStrError, ProxyError::LabelMe);
 
 #[derive(Validate, Deserialize)]
 pub struct Parameters {
@@ -178,7 +156,7 @@ where
         Some(Host::Domain(_)) => Ok(()),
         Some(Host::Ipv4(addr)) => check_addr(IpAddr::V4(addr), networks),
         Some(Host::Ipv6(addr)) => check_addr(IpAddr::V6(addr), networks),
-        None => todo!(),
+        None => Err(ProxyError::NoHost),
     }
 }
 
@@ -191,6 +169,7 @@ async fn proxy(
     //TODO better errors
     let url = Url::parse(&query.into_inner().url)?;
 
+    //TODO only allow http and https scheme
     //Check if url is not blacklisted
     check_url(&url, state.blacklisted_networks.iter())?;
 
@@ -259,8 +238,6 @@ async fn proxy(
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let args = Args::parse();
-
-    HmacSha256::new_from_slice(args.key.as_bytes()).expect("Invalid key length");
 
     println!("Starting bouncer on: {}:{}", args.listen, args.port);
 
