@@ -264,6 +264,7 @@ dependencies = [
  "mime",
  "reqwest",
  "serde",
+ "serde_json",
  "sha2",
  "url",
  "validator",

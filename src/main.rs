@@ -6,10 +6,12 @@ use hex::FromHexError;
 use hmac::{Hmac, Mac};
 use ipnetwork::IpNetwork;
 use mime::Mime;
-use reqwest::{header::CONTENT_TYPE, header::CONTENT_LENGTH, header::ToStrError, Client};
+use reqwest::{header::ToStrError, header::CONTENT_LENGTH, header::CONTENT_TYPE, Client};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::Sha256;
 use std::net::IpAddr;
+use std::time::Duration;
 use url::{Host, ParseError, Url};
 use validator::Validate;
 
@@ -18,7 +20,7 @@ type HmacSha256 = Hmac<Sha256>;
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(short, long, help = "HMAC key")]
+    #[arg(short, long, help = "HMAC key", env)]
     key: String,
 
     #[arg(short, long, default_value = "0.0.0.0")]
@@ -30,8 +32,28 @@ struct Args {
     #[arg(short, long, default_value_t = 0u64)]
     max_size: u64,
 
-    #[arg(short, long = "blacklist", default_value = "127.0.0.0/8;169.254.0.0/16;10.0.0.0/8;172.16.0.0/12")]
+    #[arg(
+        short,
+        long = "blacklist",
+        default_value = "127.0.0.0/8;169.254.0.0/16;10.0.0.0/8;172.16.0.0/12"
+    )]
     blacklisted_networks: String,
+
+    #[arg(
+        short,
+        long,
+        help = "Request timeout in millis. 0 for no timeout",
+        default_value_t = 0u64
+    )]
+    timeout: u64,
+
+    #[arg(
+        short,
+        long = "agent",
+        help = "User agent header",
+        default_value = "Bouncer/0.1.0"
+    )]
+    user_agent: String,
 }
 
 struct AppState {
@@ -45,7 +67,6 @@ struct AppState {
 pub enum ProxyError {
     RequestFailed,
     ForbiddenProxy,
-    CouldNotResolve,
     BadContentType,
     MissingContentType,
     MissingContentLength,
@@ -74,20 +95,37 @@ impl ResponseError for ProxyError {
             ProxyError::MissingContentLength => StatusCode::LENGTH_REQUIRED,
             ProxyError::ContentTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             ProxyError::UnsupportedContentType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            ProxyError::CouldNotResolve | ProxyError::LabelMe => StatusCode::INTERNAL_SERVER_ERROR,
+            ProxyError::LabelMe => StatusCode::INTERNAL_SERVER_ERROR,
         }
+    }
+
+    fn error_response(&self) -> HttpResponse {
+        let message = match *self {
+            ProxyError::RequestFailed => "Could not GET url",
+            ProxyError::ForbiddenProxy => "Will never proxy this address",
+            ProxyError::BadContentType => "Content-Type header is invalid",
+            ProxyError::MissingContentType => "Response is missing the Content-Type header",
+            ProxyError::InvalidDigest => "URL digest does not match",
+            ProxyError::BadContentLength => "Content length is not valid",
+            ProxyError::MissingContentLength => "Response is missing the Content-Length header",
+            ProxyError::ContentTooLarge => "Response body is too large to proxy",
+            ProxyError::UnsupportedContentType => "Will not proxy Content-Type",
+            ProxyError::LabelMe => "Internal server error",
+        };
+        HttpResponse::build(self.status_code())
+            .content_type(mime::APPLICATION_JSON.to_string())
+            .body(
+                json!({
+                        "error": message,
+                })
+                .to_string(),
+            )
     }
 }
 
 impl From<ParseError> for ProxyError {
     fn from(_: ParseError) -> Self {
         ProxyError::ForbiddenProxy
-    }
-}
-
-impl From<std::io::Error> for ProxyError {
-    fn from(_: std::io::Error) -> Self {
-        ProxyError::CouldNotResolve
     }
 }
 
@@ -180,7 +218,7 @@ async fn proxy(
     }
 
     let headers = resp.headers();
-    let content_type = headers 
+    let content_type = headers
         .get(CONTENT_TYPE)
         .ok_or(ProxyError::MissingContentType)?
         .to_str()?;
@@ -209,14 +247,10 @@ async fn proxy(
 //TODO
 //Add config and command line options for the following
 //  Allowed mime types
-//  Timeout
 //  SSL
-//  User agent name
 //  Better errors
-//  HMAC key
 //  Additional HTTP headers
 //  Unix socket instead of listen ip
-//  Blacklist networks
 //  Vebose logging?
 //Add command line help
 //Make endpoint filename so it doesn't download as "proxy" but as actual filename (like how discord does it
@@ -228,13 +262,20 @@ async fn main() -> std::io::Result<()> {
 
     HmacSha256::new_from_slice(args.key.as_bytes()).expect("Invalid key length");
 
+    println!("Starting bouncer on: {}:{}", args.listen, args.port);
+
     HttpServer::new(move || {
+        let mut builder = Client::builder().user_agent(args.user_agent.clone());
+        if args.timeout != 0 {
+            builder = builder.timeout(Duration::from_millis(args.timeout));
+        }
         App::new()
             .app_data(web::Data::new(AppState {
-                client: Client::new(),
+                client: builder.build().expect("Reqwest client"),
                 secret: args.key.clone(),
                 max_size: args.max_size,
-                blacklisted_networks: args.blacklisted_networks
+                blacklisted_networks: args
+                    .blacklisted_networks
                     .split(';')
                     .map(|network| network.trim().parse().expect("Expected valid CIDR network"))
                     .collect(),
