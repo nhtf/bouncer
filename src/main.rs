@@ -75,6 +75,7 @@ pub enum ProxyError {
     UnsupportedContentType,
     InvalidDigest,
     NoHost,
+    InvalidScheme,
     LabelMe,
 }
 
@@ -107,6 +108,7 @@ impl ResponseError for ProxyError {
             ProxyError::ContentTooLarge => "Response body is too large to proxy",
             ProxyError::UnsupportedContentType => "Will not proxy Content-Type",
             ProxyError::NoHost => "No host specified",
+            ProxyError::InvalidScheme => "Will only proxy http and https requests",
             ProxyError::LabelMe => "Internal server error",
         };
         HttpResponse::build(self.status_code())
@@ -179,6 +181,9 @@ async fn proxy(
     //TODO better errors
     let url = Url::parse(&query.into_inner().url)?;
 
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(ProxyError::InvalidScheme)
+    }
     //TODO only allow http and https scheme
     //Check if url is not blacklisted
     check_url(&url, state.blacklisted_networks.iter())?;
