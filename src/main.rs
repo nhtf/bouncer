@@ -35,7 +35,7 @@ struct Args {
     #[arg(
         short,
         long = "blacklist",
-        default_value = "127.0.0.0/8;169.254.0.0/16;10.0.0.0/8;172.16.0.0/12",
+        default_value = "127.0.0.0/8;169.254.0.0/16;10.0.0.0/8;172.16.0.0/12;::1/128;fe80::/10;fec0::/10;fc00::/7;::ffff:0:0/96",
         env = "BOUNCER_BLACKLIST"
     )]
     blacklisted_networks: String,
