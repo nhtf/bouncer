@@ -6,7 +6,7 @@ use hex::FromHexError;
 use hmac::{Hmac, Mac};
 use ipnetwork::IpNetwork;
 use mime::Mime;
-use reqwest::{header::ToStrError, header::CONTENT_LENGTH, header::CONTENT_TYPE, Client};
+use reqwest::{header::ToStrError, header::CONTENT_LENGTH, header::CONTENT_TYPE, Client, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Sha256;
@@ -14,6 +14,8 @@ use std::net::IpAddr;
 use std::time::Duration;
 use url::{Host, ParseError, Url};
 use validator::Validate;
+use scraper::{Html, Selector, element_ref::ElementRef};
+use std::collections::HashMap;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -79,6 +81,7 @@ pub enum ProxyError {
     InvalidDigest,
     NoHost,
     InvalidScheme,
+    CouldNotConsumeText,
     LabelMe,
 }
 
@@ -94,7 +97,7 @@ impl ResponseError for ProxyError {
             ProxyError::MissingContentLength => StatusCode::LENGTH_REQUIRED,
             ProxyError::ContentTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             ProxyError::UnsupportedContentType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            ProxyError::LabelMe => StatusCode::INTERNAL_SERVER_ERROR,
+            ProxyError::LabelMe | ProxyError::CouldNotConsumeText => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::BAD_REQUEST,
         }
     }
@@ -112,7 +115,7 @@ impl ResponseError for ProxyError {
             ProxyError::UnsupportedContentType => "Will not proxy Content-Type",
             ProxyError::NoHost => "No host specified",
             ProxyError::InvalidScheme => "Will only proxy http and https requests",
-            ProxyError::LabelMe => "Internal server error",
+            _ => "Internal server error",
         };
         HttpResponse::build(self.status_code())
             .content_type(mime::APPLICATION_JSON.to_string())
@@ -173,6 +176,83 @@ where
         Some(Host::Ipv6(addr)) => check_addr(IpAddr::V6(addr), networks),
         None => Err(ProxyError::NoHost),
     }
+}
+
+async fn fetch(url: &str, digest: &str, state: &web::Data<AppState>) -> Result<(Response, Mime), ProxyError> {
+    let url = Url::parse(url)?;
+
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err(ProxyError::InvalidScheme)
+    }
+    //TODO only allow http and https scheme
+    //Check if url is not blacklisted
+    check_url(&url, state.blacklisted_networks.iter())?;
+
+    //Verify digest
+    //unwrap will never fail for this hashing algorithm
+    let mut mac = HmacSha256::new_from_slice(state.secret.as_bytes()).unwrap();
+    mac.update(url.as_str().as_bytes());
+    mac.verify_slice(&hex::decode(digest.as_bytes())?)?;
+
+    let resp = state
+        .client
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| ProxyError::RequestFailed)?;
+
+    let addr = match resp.remote_addr() {
+        Some(addr) => Ok(addr),
+        None => Err(ProxyError::LabelMe),
+    }?;
+
+    //Check if resolved address is not blacklisted
+    if contains(addr.ip(), state.blacklisted_networks.iter()) {
+        return Err(ProxyError::ForbiddenProxy);
+    }
+    let headers = resp.headers();
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .ok_or(ProxyError::MissingContentType)?
+        .to_str()?;
+
+    let content_length: u64 = headers
+        .get(CONTENT_LENGTH)
+        .ok_or(ProxyError::MissingContentLength)?
+        .to_str()?
+        .parse()
+        .map_err(|_| ProxyError::BadContentLength)?;
+
+    if state.max_size != 0 && content_length < state.max_size {
+        return Err(ProxyError::ContentTooLarge);
+    }
+
+    let mime: Mime = content_type
+        .parse()
+        .map_err(|_| ProxyError::BadContentType)?;
+    Ok((resp, mime))
+}
+
+#[get("/{digest}/embed")]
+async fn embed(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    query: web::Query<Parameters>,
+) -> Result<impl Responder, ProxyError> {
+    let (resp, mime) = fetch(&query.url, &path.into_inner(), &state).await?;
+    
+    if mime.subtype() != mime::HTML {
+        return Err(ProxyError::BadContentType);
+    }
+    let doc = Html::parse_document(&resp.text().await.map_err(|_| ProxyError::CouldNotConsumeText)?);
+
+    let meta_selector = Selector::parse("meta").map_err(|_| ProxyError::LabelMe)?;
+    let link_selector = Selector::parse("link").map_err(|_| ProxyError::LabelMe)?;
+    let meta = doc.select(&meta_selector)
+        .map(|elem| elem.value())
+        .map(|value| { (value.attr("property").or_else(|| value.attr("name")), value.attr("content")) })
+        .filter_map(|(a, b)| a.and_then(|a| b.map(|b| (a, b))))
+        .collect::<HashMap<&str, &str>>();
 }
 
 #[get("/{digest}/proxy")]
