@@ -20,22 +20,23 @@ type HmacSha256 = Hmac<Sha256>;
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(short, long, help = "HMAC key", env)]
+    #[arg(short, long, help = "HMAC key", env = "BOUNCER_KEY")]
     key: String,
 
-    #[arg(short, long, default_value = "0.0.0.0")]
+    #[arg(short, long, default_value = "0.0.0.0", env = "BOUNCER_LISTEN")]
     listen: String,
 
-    #[arg(short, long, default_value_t = 8080u16)]
+    #[arg(short, long, default_value_t = 8080u16, env = "BOUNCER_PORT")]
     port: u16,
 
-    #[arg(short, long, default_value_t = 0u64)]
+    #[arg(short, long, default_value_t = 0u64, env = "BOUNCER_MAXSIZE")]
     max_size: u64,
 
     #[arg(
         short,
         long = "blacklist",
-        default_value = "127.0.0.0/8;169.254.0.0/16;10.0.0.0/8;172.16.0.0/12"
+        default_value = "127.0.0.0/8;169.254.0.0/16;10.0.0.0/8;172.16.0.0/12",
+        env = "BOUNCER_BLACKLIST"
     )]
     blacklisted_networks: String,
 
@@ -43,7 +44,8 @@ struct Args {
         short,
         long,
         help = "Request timeout in millis. 0 for no timeout",
-        default_value_t = 0u64
+        default_value_t = 0u64,
+        env = "BOUNCER_TIMEOUT"
     )]
     timeout: u64,
 
@@ -51,7 +53,8 @@ struct Args {
         short,
         long = "agent",
         help = "User agent header",
-        default_value = "Bouncer/0.1.0"
+        default_value = "Bouncer/0.1.0",
+        env = "BOUNCER_AGENT"
     )]
     user_agent: String,
 }
