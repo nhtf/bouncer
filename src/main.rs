@@ -120,6 +120,16 @@ impl ResponseError for ProxyError {
     }
 }
 
+macro_rules! into_proxy_error {
+    ($from:ty,$to:expr) => {
+        impl From<$from> for ProxyError {
+            fn from(_: $from) -> Self {
+                $to
+            }
+        }
+    };
+}
+
 into_proxy_error!(ParseError, ProxyError::ForbiddenProxy);
 into_proxy_error!(MacError, ProxyError::InvalidDigest);
 into_proxy_error!(FromHexError, ProxyError::InvalidDigest);
@@ -174,7 +184,7 @@ async fn proxy(
     check_url(&url, state.blacklisted_networks.iter())?;
 
     //Verify digest
-    //Unwrap should never fail since it also has been tested in main
+    //unwrap will never fail for this hashing algorithm
     let mut mac = HmacSha256::new_from_slice(state.secret.as_bytes()).unwrap();
     mac.update(url.as_str().as_bytes());
     mac.verify_slice(&hex::decode(path.into_inner().as_bytes())?)?;
