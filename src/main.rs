@@ -7,15 +7,15 @@ use hmac::{Hmac, Mac};
 use ipnetwork::IpNetwork;
 use mime::Mime;
 use reqwest::{header::ToStrError, header::CONTENT_LENGTH, header::CONTENT_TYPE, Client, Response};
+use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Sha256;
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Duration;
 use url::{Host, ParseError, Url};
 use validator::Validate;
-use scraper::{Html, Selector, element_ref::ElementRef};
-use std::collections::HashMap;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -82,6 +82,7 @@ pub enum ProxyError {
     NoHost,
     InvalidScheme,
     CouldNotConsumeText,
+    MalformedMetadata,
     LabelMe,
 }
 
@@ -97,7 +98,9 @@ impl ResponseError for ProxyError {
             ProxyError::MissingContentLength => StatusCode::LENGTH_REQUIRED,
             ProxyError::ContentTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             ProxyError::UnsupportedContentType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            ProxyError::LabelMe | ProxyError::CouldNotConsumeText => StatusCode::INTERNAL_SERVER_ERROR,
+            ProxyError::LabelMe | ProxyError::CouldNotConsumeText => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
             _ => StatusCode::BAD_REQUEST,
         }
     }
@@ -115,6 +118,7 @@ impl ResponseError for ProxyError {
             ProxyError::UnsupportedContentType => "Will not proxy Content-Type",
             ProxyError::NoHost => "No host specified",
             ProxyError::InvalidScheme => "Will only proxy http and https requests",
+            ProxyError::MalformedMetadata => "Metadata is ill-formed",
             _ => "Internal server error",
         };
         HttpResponse::build(self.status_code())
@@ -149,6 +153,30 @@ pub struct Parameters {
     url: String,
 }
 
+#[derive(Validate, Serialize)]
+pub struct MediaMetadata {
+    #[validate(url)]
+    url: String,
+
+    width: u64,
+    height: u64,
+}
+
+#[derive(Validate, Serialize)]
+pub struct Metadata {
+    #[validate(url)]
+    url: String,
+
+    //#[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    description: Option<String>,
+    #[validate]
+    image: Option<MediaMetadata>,
+    #[validate]
+    video: Option<MediaMetadata>,
+    color: Option<String>,
+}
+
 fn contains<'a, I>(addr: IpAddr, mut networks: I) -> bool
 where
     I: Iterator<Item = &'a IpNetwork>,
@@ -178,11 +206,15 @@ where
     }
 }
 
-async fn fetch(url: &str, digest: &str, state: &web::Data<AppState>) -> Result<(Response, Mime), ProxyError> {
+async fn fetch(
+    url: &str,
+    digest: &str,
+    state: &web::Data<AppState>,
+) -> Result<(Response, Mime), ProxyError> {
     let url = Url::parse(url)?;
 
     if url.scheme() != "http" && url.scheme() != "https" {
-        return Err(ProxyError::InvalidScheme)
+        return Err(ProxyError::InvalidScheme);
     }
     //TODO only allow http and https scheme
     //Check if url is not blacklisted
@@ -233,6 +265,7 @@ async fn fetch(url: &str, digest: &str, state: &web::Data<AppState>) -> Result<(
     Ok((resp, mime))
 }
 
+//TODO profile why this is so slow
 #[get("/{digest}/embed")]
 async fn embed(
     state: web::Data<AppState>,
@@ -240,19 +273,95 @@ async fn embed(
     query: web::Query<Parameters>,
 ) -> Result<impl Responder, ProxyError> {
     let (resp, mime) = fetch(&query.url, &path.into_inner(), &state).await?;
-    
-    if mime.subtype() != mime::HTML {
+
+    if mime.type_() != mime::TEXT && mime.subtype() != mime::HTML {
         return Err(ProxyError::BadContentType);
     }
-    let doc = Html::parse_document(&resp.text().await.map_err(|_| ProxyError::CouldNotConsumeText)?);
+    let doc = Html::parse_document(
+        &resp
+            .text()
+            .await
+            .map_err(|_| ProxyError::CouldNotConsumeText)?,
+    );
 
     let meta_selector = Selector::parse("meta").map_err(|_| ProxyError::LabelMe)?;
-    let link_selector = Selector::parse("link").map_err(|_| ProxyError::LabelMe)?;
-    let meta = doc.select(&meta_selector)
+    //let link_selector = Selector::parse("link").map_err(|_| ProxyError::LabelMe)?;
+    let metas: HashMap<&str, &str> = doc
+        .select(&meta_selector)
         .map(|elem| elem.value())
-        .map(|value| { (value.attr("property").or_else(|| value.attr("name")), value.attr("content")) })
+        .map(|value| {
+            (
+                value.attr("property").or_else(|| value.attr("name")),
+                value.attr("content"),
+            )
+        })
         .filter_map(|(a, b)| a.and_then(|a| b.map(|b| (a, b))))
-        .collect::<HashMap<&str, &str>>();
+        .collect();
+    /*
+    let links: HashMap<&str, &str> = doc
+        .select(&link_selector)
+        .map(|elem| elem.value())
+        .map(|value| (value.attr("rel"), value.attr("content")))
+        .filter_map(|(a, b)| a.and_then(|a| b.map(|b| (a, b))))
+        .collect();
+    */
+
+    let metadata = Metadata {
+        url: query.url.to_string(),
+        title: metas
+            .get("og:title")
+            .or(metas.get("twitter:title"))
+            .or(metas.get("title"))
+            .map(|x| x.to_string()),
+        description: metas
+            .get("og:description")
+            .or(metas.get("twitter:description"))
+            .or(metas.get("description"))
+            .map(|x| x.to_string()),
+        image: metas
+            .get("og:image")
+            .or(metas.get("og:image:secure_url"))
+            .or(metas.get("twitter:image"))
+            .or(metas.get("twitter:image:src"))
+            .map(|url| {
+                MediaMetadata {
+                    url: url.to_string(),
+                    width: metas
+                        .get("og:image:width")
+                        .unwrap_or_else(|| &"0")
+                        .parse()
+                        .unwrap_or_else(|_| 0),
+                    height: metas
+                        .get("og:image:height")
+                        .unwrap_or_else(|| &"0")
+                        .parse()
+                        .unwrap_or_else(|_| 0),
+                }
+            }),
+        video: metas
+            .get("og:video")
+            .or(metas.get("og:video:url"))
+            .or(metas.get("og:video:secure_url"))
+            .map(|url| {
+                MediaMetadata {
+                    url: url.to_string(),
+                    width: metas
+                        .get("og:video:width")
+                        .unwrap_or_else(|| &"0")
+                        .parse()
+                        .unwrap_or_else(|_| 0),
+                    height: metas
+                        .get("og:video:height")
+                        .unwrap_or_else(|| &"0")
+                        .parse()
+                        .unwrap_or_else(|_| 0),
+                }
+            }),
+        color: metas.get("theme-color").map(|x| x.to_string()),
+    };
+
+    metadata.validate().map_err(|_| ProxyError::MalformedMetadata)?;
+    Ok(web::Json(metadata))
 }
 
 #[get("/{digest}/proxy")]
@@ -265,7 +374,7 @@ async fn proxy(
     let url = Url::parse(&query.into_inner().url)?;
 
     if url.scheme() != "http" && url.scheme() != "https" {
-        return Err(ProxyError::InvalidScheme)
+        return Err(ProxyError::InvalidScheme);
     }
     //TODO only allow http and https scheme
     //Check if url is not blacklisted
@@ -356,6 +465,7 @@ async fn main() -> std::io::Result<()> {
                     .collect(),
             }))
             .service(proxy)
+            .service(embed)
     })
     .bind((args.listen, args.port))?
     .run()
