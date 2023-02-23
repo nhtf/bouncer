@@ -49,7 +49,7 @@ struct Args {
         default_value_t = 0u64,
         env = "BOUNCER_TIMEOUT"
     )]
-    timeout: u64,
+    timeout: u64, //TODO use Option<u64>?
 
     #[arg(
         short,
@@ -69,7 +69,7 @@ struct AppState {
 }
 
 #[derive(Serialize, Debug)]
-pub enum ProxyError {
+enum ProxyError {
     RequestFailed,
     ForbiddenProxy,
     BadContentType,
@@ -84,6 +84,48 @@ pub enum ProxyError {
     CouldNotConsumeText,
     MalformedMetadata,
     LabelMe,
+}
+
+#[derive(Validate, Deserialize)]
+struct Parameters {
+    #[validate(url)]
+    url: String,
+}
+
+#[derive(Validate, Serialize, Debug)]
+struct SignedURL {
+    #[validate(url)]
+    url: String,
+
+    digest: String,
+}
+
+#[derive(Validate, Serialize, Debug)]
+struct MediaMetadata {
+    #[validate]
+    url: SignedURL,
+
+    width: u64,
+    height: u64,
+}
+
+#[derive(Validate, Serialize, Debug)]
+struct Metadata {
+    #[validate(url)]
+    url: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[validate]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image: Option<MediaMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate]
+    video: Option<MediaMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    color: Option<String>,
 }
 
 impl std::fmt::Display for ProxyError {
@@ -146,45 +188,6 @@ into_proxy_error!(ParseError, ProxyError::ForbiddenProxy);
 into_proxy_error!(MacError, ProxyError::InvalidDigest);
 into_proxy_error!(FromHexError, ProxyError::InvalidDigest);
 into_proxy_error!(ToStrError, ProxyError::LabelMe);
-
-#[derive(Validate, Deserialize)]
-pub struct Parameters {
-    #[validate(url)]
-    url: String,
-}
-
-#[derive(Validate, Serialize, Debug)]
-pub struct SignedURL {
-    #[validate(url)]
-    url: String,
-
-    digest: String,
-}
-
-#[derive(Validate, Serialize, Debug)]
-pub struct MediaMetadata {
-    #[validate]
-    url: SignedURL,
-
-    width: u64,
-    height: u64,
-}
-
-#[derive(Validate, Serialize, Debug)]
-pub struct Metadata {
-    #[validate(url)]
-    url: String,
-    //TODO add digest
-
-    //#[serde(skip_serializing_if = "Option::is_none")]
-    title: Option<String>,
-    description: Option<String>,
-    #[validate]
-    image: Option<MediaMetadata>,
-    #[validate]
-    video: Option<MediaMetadata>,
-    color: Option<String>,
-}
 
 fn contains<'a, I>(addr: IpAddr, mut networks: I) -> bool
 where
@@ -363,7 +366,6 @@ fn extract_metadata(data: String, url: &str, secret: &str) -> Result<Metadata, P
     Ok(metadata)
 }
 
-//TODO profile why this is so slow
 #[get("/{digest}/embed")]
 async fn embed(
     state: web::Data<AppState>,
@@ -386,60 +388,7 @@ async fn proxy(
     path: web::Path<String>,
     query: web::Query<Parameters>,
 ) -> Result<impl Responder, ProxyError> {
-    //TODO better errors
-    let url = Url::parse(&query.into_inner().url)?;
-
-    if url.scheme() != "http" && url.scheme() != "https" {
-        return Err(ProxyError::InvalidScheme);
-    }
-    //TODO only allow http and https scheme
-    //Check if url is not blacklisted
-    check_url(&url, state.blacklisted_networks.iter())?;
-
-    //Verify digest
-    //unwrap will never fail for this hashing algorithm
-    let mut mac = HmacSha256::new_from_slice(state.secret.as_bytes()).unwrap();
-    mac.update(url.as_str().as_bytes());
-    mac.verify_slice(&hex::decode(path.into_inner().as_bytes())?)?;
-
-    let resp = state
-        .client
-        .get(url)
-        .send()
-        .await
-        .map_err(|_| ProxyError::RequestFailed)?;
-
-    let addr = match resp.remote_addr() {
-        Some(addr) => Ok(addr),
-        None => Err(ProxyError::LabelMe),
-    }?;
-
-    //Check if resolved address is not blacklisted
-    if contains(addr.ip(), state.blacklisted_networks.iter()) {
-        return Err(ProxyError::ForbiddenProxy);
-    }
-
-    let headers = resp.headers();
-    let content_type = headers
-        .get(CONTENT_TYPE)
-        .ok_or(ProxyError::MissingContentType)?
-        .to_str()?;
-
-    let content_length: u64 = headers
-        .get(CONTENT_LENGTH)
-        .ok_or(ProxyError::MissingContentLength)?
-        .to_str()?
-        .parse()
-        .map_err(|_| ProxyError::BadContentLength)?;
-
-    if state.max_size != 0 && content_length < state.max_size {
-        return Err(ProxyError::ContentTooLarge);
-    }
-
-    let mime: Mime = content_type
-        .parse()
-        .map_err(|_| ProxyError::BadContentType)?;
-
+    let (resp, mime) = fetch(&query.url, &path.into_inner(), &state).await?;
     match mime.type_() {
         mime::IMAGE | mime::VIDEO => Ok(HttpResponse::Ok().streaming(resp.bytes_stream())),
         _ => Err(ProxyError::UnsupportedContentType),
