@@ -1,5 +1,5 @@
 use actix_web::http::StatusCode;
-use actix_web::{get, web, App, HttpResponse, HttpServer, Responder, ResponseError};
+use actix_web::{get, web, App, HttpResponse, HttpServer, Responder, ResponseError, http::header};
 use clap::Parser;
 use digest::MacError;
 use hex::FromHexError;
@@ -228,15 +228,14 @@ async fn fetch(
     if url.scheme() != "http" && url.scheme() != "https" {
         return Err(ProxyError::InvalidScheme);
     }
-    //TODO only allow http and https scheme
     //Check if url is not blacklisted
     check_url(&url, state.blacklisted_networks.iter())?;
 
     //Verify digest
-    //unwrap will never fail for this hashing algorithm
-    let mut mac = HmacSha256::new_from_slice(state.secret.as_bytes()).unwrap();
-    mac.update(url.as_str().as_bytes());
-    mac.verify_slice(&hex::decode(digest.as_bytes())?)?;
+    HmacSha256::new_from_slice(state.secret.as_bytes())
+        .unwrap() //This unwrap will never fail when using the sha256 hashing algorithm
+        .chain_update(url.as_str().as_bytes())
+        .verify_slice(&hex::decode(digest.as_bytes())?)?;
 
     let resp = state
         .client
@@ -319,50 +318,60 @@ fn extract_metadata(data: String, url: &str, secret: &str) -> Result<Metadata, P
             .or_else(|| metas.get("og:image:secure_url"))
             .or_else(|| metas.get("twitter:image"))
             .or_else(|| metas.get("twitter:image:src"))
-            .map(|url| {
-                MediaMetadata {
-                    url: SignedURL {
-                        url: url.to_string(),
-                        digest: hex::encode(HmacSha256::new_from_slice(secret.as_bytes()).unwrap().chain_update(url).finalize().into_bytes()),
-                    },
-                    width: metas
-                        .get("og:image:width")
-                        .unwrap_or(&"0")
-                        .parse()
-                        .unwrap_or(0),
-                    height: metas
-                        .get("og:image:height")
-                        .unwrap_or(&"0")
-                        .parse()
-                        .unwrap_or(0),
-                }
+            .map(|url| MediaMetadata {
+                url: SignedURL {
+                    url: url.to_string(),
+                    digest: hex::encode(
+                        HmacSha256::new_from_slice(secret.as_bytes())
+                            .unwrap()
+                            .chain_update(url)
+                            .finalize()
+                            .into_bytes(),
+                    ),
+                },
+                width: metas
+                    .get("og:image:width")
+                    .unwrap_or(&"0")
+                    .parse()
+                    .unwrap_or(0),
+                height: metas
+                    .get("og:image:height")
+                    .unwrap_or(&"0")
+                    .parse()
+                    .unwrap_or(0),
             }),
         video: metas
             .get("og:video")
             .or_else(|| metas.get("og:video:url"))
             .or_else(|| metas.get("og:video:secure_url"))
-            .map(|url| {
-                MediaMetadata {
-                    url: SignedURL {
-                        url: url.to_string(),
-                        digest: hex::encode(HmacSha256::new_from_slice(secret.as_bytes()).unwrap().chain_update(url).finalize().into_bytes()),
-                    },
-                    width: metas
-                        .get("og:video:width")
-                        .unwrap_or(&"0")
-                        .parse()
-                        .unwrap_or(0),
-                    height: metas
-                        .get("og:video:height")
-                        .unwrap_or(&"0")
-                        .parse()
-                        .unwrap_or(0),
-                }
+            .map(|url| MediaMetadata {
+                url: SignedURL {
+                    url: url.to_string(),
+                    digest: hex::encode(
+                        HmacSha256::new_from_slice(secret.as_bytes())
+                            .unwrap()
+                            .chain_update(url)
+                            .finalize()
+                            .into_bytes(),
+                    ),
+                },
+                width: metas
+                    .get("og:video:width")
+                    .unwrap_or(&"0")
+                    .parse()
+                    .unwrap_or(0),
+                height: metas
+                    .get("og:video:height")
+                    .unwrap_or(&"0")
+                    .parse()
+                    .unwrap_or(0),
             }),
         color: metas.get("theme-color").map(|x| x.to_string()),
     };
 
-    metadata.validate().map_err(|_| ProxyError::MalformedMetadata)?;
+    metadata
+        .validate()
+        .map_err(|_| ProxyError::MalformedMetadata)?;
     Ok(metadata)
 }
 
@@ -377,9 +386,16 @@ async fn embed(
     if mime.type_() != mime::TEXT && mime.subtype() != mime::HTML {
         return Err(ProxyError::BadContentType);
     }
-    let metadata = extract_metadata(resp.text().await.map_err(|_| ProxyError::CouldNotConsumeText)?, &query.url, &state.secret)?;
+    let metadata = extract_metadata(
+        resp.text()
+            .await
+            .map_err(|_| ProxyError::CouldNotConsumeText)?,
+        &query.url,
+        &state.secret,
+    )?;
 
-    Ok(web::Json(metadata))
+    //TODO replace star with something more restrictive
+    Ok(HttpResponse::Ok().insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")).json(metadata))
 }
 
 #[get("/{digest}/proxy")]
