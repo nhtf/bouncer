@@ -153,19 +153,28 @@ pub struct Parameters {
     url: String,
 }
 
-#[derive(Validate, Serialize)]
-pub struct MediaMetadata {
+#[derive(Validate, Serialize, Debug)]
+pub struct SignedURL {
     #[validate(url)]
     url: String,
+
+    digest: String,
+}
+
+#[derive(Validate, Serialize, Debug)]
+pub struct MediaMetadata {
+    #[validate]
+    url: SignedURL,
 
     width: u64,
     height: u64,
 }
 
-#[derive(Validate, Serialize)]
+#[derive(Validate, Serialize, Debug)]
 pub struct Metadata {
     #[validate(url)]
     url: String,
+    //TODO add digest
 
     //#[serde(skip_serializing_if = "Option::is_none")]
     title: Option<String>,
@@ -265,24 +274,8 @@ async fn fetch(
     Ok((resp, mime))
 }
 
-//TODO profile why this is so slow
-#[get("/{digest}/embed")]
-async fn embed(
-    state: web::Data<AppState>,
-    path: web::Path<String>,
-    query: web::Query<Parameters>,
-) -> Result<impl Responder, ProxyError> {
-    let (resp, mime) = fetch(&query.url, &path.into_inner(), &state).await?;
-
-    if mime.type_() != mime::TEXT && mime.subtype() != mime::HTML {
-        return Err(ProxyError::BadContentType);
-    }
-    let doc = Html::parse_document(
-        &resp
-            .text()
-            .await
-            .map_err(|_| ProxyError::CouldNotConsumeText)?,
-    );
+fn extract_metadata(data: String, url: &str, secret: &str) -> Result<Metadata, ProxyError> {
+    let doc = Html::parse_document(&data);
 
     let meta_selector = Selector::parse("meta").map_err(|_| ProxyError::LabelMe)?;
     //let link_selector = Selector::parse("link").map_err(|_| ProxyError::LabelMe)?;
@@ -307,60 +300,83 @@ async fn embed(
     */
 
     let metadata = Metadata {
-        url: query.url.to_string(),
+        url: url.to_string(),
         title: metas
             .get("og:title")
-            .or(metas.get("twitter:title"))
-            .or(metas.get("title"))
+            .or_else(|| metas.get("twitter:title"))
+            .or_else(|| metas.get("title"))
             .map(|x| x.to_string()),
         description: metas
             .get("og:description")
-            .or(metas.get("twitter:description"))
-            .or(metas.get("description"))
+            .or_else(|| metas.get("twitter:description"))
+            .or_else(|| metas.get("description"))
             .map(|x| x.to_string()),
         image: metas
             .get("og:image")
-            .or(metas.get("og:image:secure_url"))
-            .or(metas.get("twitter:image"))
-            .or(metas.get("twitter:image:src"))
+            .or_else(|| metas.get("og:image:secure_url"))
+            .or_else(|| metas.get("twitter:image"))
+            .or_else(|| metas.get("twitter:image:src"))
             .map(|url| {
                 MediaMetadata {
-                    url: url.to_string(),
+                    url: SignedURL {
+                        url: url.to_string(),
+                        digest: hex::encode(HmacSha256::new_from_slice(secret.as_bytes()).unwrap().chain_update(url).finalize().into_bytes()),
+                    },
                     width: metas
                         .get("og:image:width")
-                        .unwrap_or_else(|| &"0")
+                        .unwrap_or(&"0")
                         .parse()
-                        .unwrap_or_else(|_| 0),
+                        .unwrap_or(0),
                     height: metas
                         .get("og:image:height")
-                        .unwrap_or_else(|| &"0")
+                        .unwrap_or(&"0")
                         .parse()
-                        .unwrap_or_else(|_| 0),
+                        .unwrap_or(0),
                 }
             }),
         video: metas
             .get("og:video")
-            .or(metas.get("og:video:url"))
-            .or(metas.get("og:video:secure_url"))
+            .or_else(|| metas.get("og:video:url"))
+            .or_else(|| metas.get("og:video:secure_url"))
             .map(|url| {
                 MediaMetadata {
-                    url: url.to_string(),
+                    url: SignedURL {
+                        url: url.to_string(),
+                        digest: hex::encode(HmacSha256::new_from_slice(secret.as_bytes()).unwrap().chain_update(url).finalize().into_bytes()),
+                    },
                     width: metas
                         .get("og:video:width")
-                        .unwrap_or_else(|| &"0")
+                        .unwrap_or(&"0")
                         .parse()
-                        .unwrap_or_else(|_| 0),
+                        .unwrap_or(0),
                     height: metas
                         .get("og:video:height")
-                        .unwrap_or_else(|| &"0")
+                        .unwrap_or(&"0")
                         .parse()
-                        .unwrap_or_else(|_| 0),
+                        .unwrap_or(0),
                 }
             }),
         color: metas.get("theme-color").map(|x| x.to_string()),
     };
 
     metadata.validate().map_err(|_| ProxyError::MalformedMetadata)?;
+    Ok(metadata)
+}
+
+//TODO profile why this is so slow
+#[get("/{digest}/embed")]
+async fn embed(
+    state: web::Data<AppState>,
+    path: web::Path<String>,
+    query: web::Query<Parameters>,
+) -> Result<impl Responder, ProxyError> {
+    let (resp, mime) = fetch(&query.url, &path.into_inner(), &state).await?;
+
+    if mime.type_() != mime::TEXT && mime.subtype() != mime::HTML {
+        return Err(ProxyError::BadContentType);
+    }
+    let metadata = extract_metadata(resp.text().await.map_err(|_| ProxyError::CouldNotConsumeText)?, &query.url, &state.secret)?;
+
     Ok(web::Json(metadata))
 }
 
