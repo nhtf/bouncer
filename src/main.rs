@@ -16,6 +16,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 use url::{Host, ParseError, Url};
 use validator::Validate;
+use futures_util::StreamExt;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -31,8 +32,8 @@ struct Args {
     #[arg(short, long, default_value_t = 8080u16, env = "BOUNCER_PORT")]
     port: u16,
 
-    #[arg(short, long, default_value_t = 0u64, env = "BOUNCER_MAXSIZE")]
-    max_size: u64,
+    #[arg(short, long, default_value_t = 0usize, env = "BOUNCER_MAXSIZE")]
+    max_size: usize,
 
     #[arg(
         short,
@@ -64,7 +65,7 @@ struct Args {
 struct AppState {
     client: Client,
     secret: String,
-    max_size: u64,
+    max_size: usize,
     blacklisted_networks: Vec<IpNetwork>,
 }
 
@@ -259,15 +260,16 @@ async fn fetch(
         .ok_or(ProxyError::MissingContentType)?
         .to_str()?;
 
-    let content_length: u64 = headers
+    let content_length = headers
         .get(CONTENT_LENGTH)
-        .ok_or(ProxyError::MissingContentLength)?
-        .to_str()?
-        .parse()
-        .map_err(|_| ProxyError::BadContentLength)?;
+        .and_then(|val| val.to_str().ok())
+        .and_then(|length| length.parse::<usize>().ok());//TODO error on parse fail
+        //.map(|length| length.to_str()?.parse::<u64>().map_err(|_| ProxyError::BadContentLength)?);
 
-    if state.max_size != 0 && content_length < state.max_size {
-        return Err(ProxyError::ContentTooLarge);
+    if state.max_size != 0 && let Some(length) = content_length {
+        if length > state.max_size {
+            return Err(ProxyError::ContentTooLarge);
+        }
     }
 
     let mime: Mime = content_type
@@ -307,7 +309,7 @@ fn extract_metadata(data: String, url: &str, secret: &str) -> Result<Metadata, P
             .get("og:title")
             .or_else(|| metas.get("twitter:title"))
             .or_else(|| metas.get("title"))
-            .map(|x| x.to_string()),
+            .map(|x| x.to_string()),//TODO fallback to title
         description: metas
             .get("og:description")
             .or_else(|| metas.get("twitter:description"))
@@ -387,7 +389,7 @@ async fn embed(
         return Err(ProxyError::BadContentType);
     }
     let metadata = extract_metadata(
-        resp.text()
+        resp.text() //TODO check size of body, possible DoS
             .await
             .map_err(|_| ProxyError::CouldNotConsumeText)?,
         &query.url,
@@ -405,8 +407,22 @@ async fn proxy(
     query: web::Query<Parameters>,
 ) -> Result<impl Responder, ProxyError> {
     let (resp, mime) = fetch(&query.url, &path.into_inner(), &state).await?;
+    let mut stream = resp.bytes_stream();
+    let mut length: usize = 0;
+    let mut vec = Vec::new(); //TODO allocate with some capacity?
+
+    while let Some(item) = stream.next().await && length <= state.max_size {
+        let content = item.map_err(|_| ProxyError::LabelMe)?;
+        length += content.len();
+        vec.push(content);
+    }
+
+    if length > state.max_size {
+        return Err(ProxyError::ContentTooLarge);
+    }
+
     match mime.type_() {
-        mime::IMAGE | mime::VIDEO => Ok(HttpResponse::Ok().streaming(resp.bytes_stream())),
+        mime::IMAGE | mime::VIDEO => Ok(HttpResponse::Ok().body(vec.into::<Bytes>())),
         _ => Err(ProxyError::UnsupportedContentType),
     }
 }
