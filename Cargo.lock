@@ -253,11 +253,12 @@ dependencies = [
 
 [[package]]
 name = "bouncer"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "actix-web",
  "clap",
  "digest",
+ "futures-util",
  "hex",
  "hmac",
  "ipnetwork",
