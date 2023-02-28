@@ -422,7 +422,7 @@ async fn proxy(
     });
 
     match mime.type_() {
-        mime::IMAGE | mime::VIDEO => Ok(HttpResponse::Ok().streaming(stream)),
+        mime::IMAGE | mime::VIDEO => Ok(HttpResponse::Ok().insert_header(header::ContentType(mime)).streaming(stream)),
         _ => Err(ProxyError::UnsupportedContentType),
     }
 }
