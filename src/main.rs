@@ -1,5 +1,7 @@
 use actix_web::http::StatusCode;
-use actix_web::{get, http::header, web, App, HttpResponse, HttpServer, Responder, ResponseError};
+use actix_web::{
+    get, http::header, middleware, web, App, HttpResponse, HttpServer, Responder, ResponseError,
+};
 use clap::Parser;
 use digest::MacError;
 use futures::{future, stream::StreamExt};
@@ -59,6 +61,13 @@ struct Args {
         env = "BOUNCER_AGENT"
     )]
     user_agent: String,
+
+    #[arg(
+        short = 'H',
+        long = "header",
+        help = "Add additional headers to all responses. Can be used multiple times"
+    )]
+    headers: Vec<String>,
 }
 
 struct AppState {
@@ -223,7 +232,7 @@ async fn fetch(
     digest: &str,
     state: &web::Data<AppState>,
 ) -> Result<(Response, Mime), ProxyError> {
-    let url = Url::parse(url)?;//TODO use actix_web::http::uri instead
+    let url = Url::parse(url)?; //TODO use actix_web::http::uri instead
 
     if url.scheme() != "http" && url.scheme() != "https" {
         return Err(ProxyError::InvalidScheme);
@@ -424,7 +433,6 @@ async fn proxy(
     match mime.type_() {
         mime::IMAGE | mime::VIDEO => Ok(HttpResponse::Ok()
             .insert_header(header::ContentType(mime))
-            .insert_header((header::X_CONTENT_TYPE_OPTIONS, "nosniff"))
             .streaming(stream)),
         _ => Err(ProxyError::UnsupportedContentType),
     }
@@ -453,6 +461,16 @@ async fn main() -> std::io::Result<()> {
         if let Some(timeout) = args.timeout {
             builder = builder.timeout(Duration::from_millis(timeout));
         }
+        let mut default_headers =
+            middleware::DefaultHeaders::new().add((header::X_CONTENT_TYPE_OPTIONS, "nosniff"));
+        for header in &args.headers {
+            default_headers = default_headers.add(
+                header
+                    .split_once('=')
+                    .expect("expected header in format: \"key:value\""),
+            );
+        }
+
         App::new()
             .app_data(web::Data::new(AppState {
                 client: builder.build().expect("Reqwest client"),
@@ -464,6 +482,7 @@ async fn main() -> std::io::Result<()> {
                     .map(|network| network.trim().parse().expect("Expected valid CIDR network"))
                     .collect(),
             }))
+            .wrap(default_headers)
             .service(proxy)
             .service(embed)
     })
