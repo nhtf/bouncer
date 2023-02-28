@@ -16,7 +16,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 use url::{Host, ParseError, Url};
 use validator::Validate;
-use futures_util::StreamExt;
+use futures::{future, stream::self, stream::StreamExt};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -32,8 +32,8 @@ struct Args {
     #[arg(short, long, default_value_t = 8080u16, env = "BOUNCER_PORT")]
     port: u16,
 
-    #[arg(short, long, default_value_t = 0usize, env = "BOUNCER_MAXSIZE")]
-    max_size: usize,
+    #[arg(short, long, env = "BOUNCER_MAXSIZE")]
+    max_length: Option<usize>,
 
     #[arg(
         short,
@@ -47,10 +47,9 @@ struct Args {
         short,
         long,
         help = "Request timeout in millis. 0 for no timeout",
-        default_value_t = 0u64,
         env = "BOUNCER_TIMEOUT"
     )]
-    timeout: u64, //TODO use Option<u64>?
+    timeout: Option<u64>,
 
     #[arg(
         short,
@@ -65,7 +64,7 @@ struct Args {
 struct AppState {
     client: Client,
     secret: String,
-    max_size: usize,
+    max_length: Option<usize>,
     blacklisted_networks: Vec<IpNetwork>,
 }
 
@@ -266,11 +265,12 @@ async fn fetch(
         .and_then(|length| length.parse::<usize>().ok());//TODO error on parse fail
         //.map(|length| length.to_str()?.parse::<u64>().map_err(|_| ProxyError::BadContentLength)?);
 
-    if state.max_size != 0 && let Some(length) = content_length {
-        if length > state.max_size {
-            return Err(ProxyError::ContentTooLarge);
-        }
-    }
+    /*TODO uncomment
+    match (state.max_length, content_length) {
+        (Some(max_length), Some(length)) if length > max_length => Err(ProxyError::ContentTooLarge),
+        _ => Ok(()),
+    }?;
+    */
 
     let mime: Mime = content_type
         .parse()
@@ -407,22 +407,22 @@ async fn proxy(
     query: web::Query<Parameters>,
 ) -> Result<impl Responder, ProxyError> {
     let (resp, mime) = fetch(&query.url, &path.into_inner(), &state).await?;
-    let mut stream = resp.bytes_stream();
-    let mut length: usize = 0;
-    let mut vec = Vec::new(); //TODO allocate with some capacity?
 
-    while let Some(item) = stream.next().await && length <= state.max_size {
-        let content = item.map_err(|_| ProxyError::LabelMe)?;
-        length += content.len();
-        vec.push(content);
-    }
-
-    if length > state.max_size {
-        return Err(ProxyError::ContentTooLarge);
-    }
+    let mut length = 0;
+    let stream = resp.bytes_stream().take_while(move |part| {
+        if let Some(max_length) = state.max_length {
+            match part {
+                Ok(content) => length += content.len(),
+                Err(_) => (),
+            };
+            future::ready(length < max_length)
+        } else {
+            future::ready(true)
+        }
+    });
 
     match mime.type_() {
-        mime::IMAGE | mime::VIDEO => Ok(HttpResponse::Ok().body(vec.into::<Bytes>())),
+        mime::IMAGE | mime::VIDEO => Ok(HttpResponse::Ok().streaming(stream)),
         _ => Err(ProxyError::UnsupportedContentType),
     }
 }
@@ -447,14 +447,14 @@ async fn main() -> std::io::Result<()> {
 
     HttpServer::new(move || {
         let mut builder = Client::builder().user_agent(args.user_agent.clone());
-        if args.timeout != 0 {
-            builder = builder.timeout(Duration::from_millis(args.timeout));
+        if let Some(timeout) = args.timeout {
+            builder = builder.timeout(Duration::from_millis(timeout));
         }
         App::new()
             .app_data(web::Data::new(AppState {
                 client: builder.build().expect("Reqwest client"),
                 secret: args.key.clone(),
-                max_size: args.max_size,
+                max_length: args.max_length,
                 blacklisted_networks: args
                     .blacklisted_networks
                     .split(';')
