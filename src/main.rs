@@ -265,12 +265,10 @@ async fn fetch(
         .and_then(|length| length.parse::<usize>().ok());//TODO error on parse fail
         //.map(|length| length.to_str()?.parse::<u64>().map_err(|_| ProxyError::BadContentLength)?);
 
-    /*TODO uncomment
     match (state.max_length, content_length) {
         (Some(max_length), Some(length)) if length > max_length => Err(ProxyError::ContentTooLarge),
         _ => Ok(()),
     }?;
-    */
 
     let mime: Mime = content_type
         .parse()
