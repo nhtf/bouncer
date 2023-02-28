@@ -223,7 +223,7 @@ async fn fetch(
     digest: &str,
     state: &web::Data<AppState>,
 ) -> Result<(Response, Mime), ProxyError> {
-    let url = Url::parse(url)?;
+    let url = Url::parse(url)?;//TODO use actix_web::http::uri instead
 
     if url.scheme() != "http" && url.scheme() != "https" {
         return Err(ProxyError::InvalidScheme);
@@ -424,6 +424,7 @@ async fn proxy(
     match mime.type_() {
         mime::IMAGE | mime::VIDEO => Ok(HttpResponse::Ok()
             .insert_header(header::ContentType(mime))
+            .insert_header((header::X_CONTENT_TYPE_OPTIONS, "nosniff"))
             .streaming(stream)),
         _ => Err(ProxyError::UnsupportedContentType),
     }
