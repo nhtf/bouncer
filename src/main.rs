@@ -1,7 +1,8 @@
 use actix_web::http::StatusCode;
-use actix_web::{get, web, App, HttpResponse, HttpServer, Responder, ResponseError, http::header};
+use actix_web::{get, http::header, web, App, HttpResponse, HttpServer, Responder, ResponseError};
 use clap::Parser;
 use digest::MacError;
+use futures::{future, stream::StreamExt};
 use hex::FromHexError;
 use hmac::{Hmac, Mac};
 use ipnetwork::IpNetwork;
@@ -16,7 +17,6 @@ use std::net::IpAddr;
 use std::time::Duration;
 use url::{Host, ParseError, Url};
 use validator::Validate;
-use futures::{future, stream::StreamExt};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -262,8 +262,8 @@ async fn fetch(
     let content_length = headers
         .get(CONTENT_LENGTH)
         .and_then(|val| val.to_str().ok())
-        .and_then(|length| length.parse::<usize>().ok());//TODO error on parse fail
-        //.map(|length| length.to_str()?.parse::<u64>().map_err(|_| ProxyError::BadContentLength)?);
+        .and_then(|length| length.parse::<usize>().ok()); //TODO error on parse fail
+                                                          //.map(|length| length.to_str()?.parse::<u64>().map_err(|_| ProxyError::BadContentLength)?);
 
     match (state.max_length, content_length) {
         (Some(max_length), Some(length)) if length > max_length => Err(ProxyError::ContentTooLarge),
@@ -307,7 +307,7 @@ fn extract_metadata(data: String, url: &str, secret: &str) -> Result<Metadata, P
             .get("og:title")
             .or_else(|| metas.get("twitter:title"))
             .or_else(|| metas.get("title"))
-            .map(|x| x.to_string()),//TODO fallback to title
+            .map(|x| x.to_string()), //TODO fallback to title
         description: metas
             .get("og:description")
             .or_else(|| metas.get("twitter:description"))
@@ -395,7 +395,9 @@ async fn embed(
     )?;
 
     //TODO replace star with something more restrictive
-    Ok(HttpResponse::Ok().insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")).json(metadata))
+    Ok(HttpResponse::Ok()
+        .insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"))
+        .json(metadata))
 }
 
 #[get("/{digest}/proxy")]
@@ -420,7 +422,9 @@ async fn proxy(
     });
 
     match mime.type_() {
-        mime::IMAGE | mime::VIDEO => Ok(HttpResponse::Ok().insert_header(header::ContentType(mime)).streaming(stream)),
+        mime::IMAGE | mime::VIDEO => Ok(HttpResponse::Ok()
+            .insert_header(header::ContentType(mime))
+            .streaming(stream)),
         _ => Err(ProxyError::UnsupportedContentType),
     }
 }
