@@ -16,7 +16,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 use url::{Host, ParseError, Url};
 use validator::Validate;
-use futures::{future, stream::self, stream::StreamExt};
+use futures::{future, stream::StreamExt};
 
 type HmacSha256 = Hmac<Sha256>;
 
