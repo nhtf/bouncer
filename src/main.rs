@@ -283,7 +283,7 @@ async fn fetch(
 }
 
 fn extract_metadata(data: &str, url: &str, secret: &str) -> Result<Metadata, ProxyError> {
-    let doc = Html::parse_document(&data);
+    let doc = Html::parse_document(data);
 
     let meta_selector = Selector::parse("meta").map_err(|_| ProxyError::LabelMe)?;
     //let link_selector = Selector::parse("link").map_err(|_| ProxyError::LabelMe)?;
