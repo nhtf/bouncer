@@ -4,12 +4,13 @@ use actix_web::{
 };
 use clap::Parser;
 use digest::MacError;
+use encoding_rs::{Encoding, UTF_8};
 use futures::{future, stream::StreamExt};
 use hex::FromHexError;
 use hmac::{Hmac, Mac};
 use ipnetwork::IpNetwork;
 use mime::Mime;
-use reqwest::{header::ToStrError, header::CONTENT_LENGTH, header::CONTENT_TYPE, Client, Response};
+use reqwest::{header::ToStrError, header::CONTENT_TYPE, Client, Response};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -19,6 +20,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 use url::{Host, ParseError, Url};
 use validator::Validate;
+use std::borrow::Cow;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -83,15 +85,14 @@ enum ProxyError {
     ForbiddenProxy,
     BadContentType,
     MissingContentType,
-    MissingContentLength,
     BadContentLength,
     ContentTooLarge,
     UnsupportedContentType,
     InvalidDigest,
     NoHost,
     InvalidScheme,
-    CouldNotConsumeText,
     MalformedMetadata,
+    MalformedText,
     LabelMe,
 }
 
@@ -146,10 +147,10 @@ impl std::fmt::Display for ProxyError {
 impl ResponseError for ProxyError {
     fn status_code(&self) -> StatusCode {
         match *self {
-            ProxyError::MissingContentLength => StatusCode::LENGTH_REQUIRED,
             ProxyError::ContentTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             ProxyError::UnsupportedContentType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            ProxyError::LabelMe | ProxyError::CouldNotConsumeText => {
+            ProxyError::MalformedText => StatusCode::UNPROCESSABLE_ENTITY,
+            ProxyError::LabelMe => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             _ => StatusCode::BAD_REQUEST,
@@ -164,12 +165,12 @@ impl ResponseError for ProxyError {
             ProxyError::MissingContentType => "Response is missing the Content-Type header",
             ProxyError::InvalidDigest => "URL digest does not match",
             ProxyError::BadContentLength => "Content length is not valid",
-            ProxyError::MissingContentLength => "Response is missing the Content-Length header",
             ProxyError::ContentTooLarge => "Response body is too large to proxy",
             ProxyError::UnsupportedContentType => "Will not proxy Content-Type",
             ProxyError::NoHost => "No host specified",
             ProxyError::InvalidScheme => "Will only proxy http and https requests",
             ProxyError::MalformedMetadata => "Metadata is ill-formed",
+            ProxyError::MalformedText => "Text was malformed",
             _ => "Internal server error",
         };
         HttpResponse::build(self.status_code())
@@ -268,14 +269,10 @@ async fn fetch(
         .ok_or(ProxyError::MissingContentType)?
         .to_str()?;
 
-    let content_length = headers
-        .get(CONTENT_LENGTH)
-        .and_then(|val| val.to_str().ok())
-        .and_then(|length| length.parse::<usize>().ok()); //TODO error on parse fail
-                                                          //.map(|length| length.to_str()?.parse::<u64>().map_err(|_| ProxyError::BadContentLength)?);
-
-    match (state.max_length, content_length) {
-        (Some(max_length), Some(length)) if length > max_length => Err(ProxyError::ContentTooLarge),
+    match (state.max_length, resp.content_length()) {
+        (Some(max_length), Some(length)) if length as usize > max_length => {
+            Err(ProxyError::ContentTooLarge)
+        }
         _ => Ok(()),
     }?;
 
@@ -285,7 +282,7 @@ async fn fetch(
     Ok((resp, mime))
 }
 
-fn extract_metadata(data: String, url: &str, secret: &str) -> Result<Metadata, ProxyError> {
+fn extract_metadata(data: &str, url: &str, secret: &str) -> Result<Metadata, ProxyError> {
     let doc = Html::parse_document(&data);
 
     let meta_selector = Selector::parse("meta").map_err(|_| ProxyError::LabelMe)?;
@@ -395,10 +392,46 @@ async fn embed(
     if mime.type_() != mime::TEXT && mime.subtype() != mime::HTML {
         return Err(ProxyError::BadContentType);
     }
-    let metadata = extract_metadata(
-        resp.text() //TODO check size of body, possible DoS
+    let bytes: Vec<u8> = match state.max_length {
+        Some(max_length) => {
+            let mut bytes = Vec::new();
+            let mut stream = resp.bytes_stream();
+            let mut length = 0;
+            while let Some(part) = stream.next().await {
+                let content = part.map_err(|_| ProxyError::LabelMe)?;
+                length += content.len();
+                bytes.push(content.into_iter());
+                if length > max_length {
+                    return Err(ProxyError::ContentTooLarge);
+                }
+            }
+            Ok::<Vec<u8>, ProxyError>(bytes.into_iter().flatten().collect())
+        }
+        None => resp
+            .bytes()
             .await
-            .map_err(|_| ProxyError::CouldNotConsumeText)?,
+            .map(Vec::from)
+            .map_err(|_| ProxyError::LabelMe),
+    }?;
+    let encoding = Encoding::for_label(mime
+            .get_param("charset")
+            .map(Into::into)
+            .unwrap_or("utf-8")
+            .as_bytes()
+        ).unwrap_or(UTF_8);
+    let (text, _, malformed) = encoding.decode(&bytes);
+
+    if malformed {
+        return Err(ProxyError::MalformedText);
+    }
+
+    let text = match &text {
+        Cow::Owned(s) => s.as_str(),
+        Cow::Borrowed(s) => s,
+    };
+
+    let metadata = extract_metadata(
+        text,
         &query.url,
         &state.secret,
     )?;

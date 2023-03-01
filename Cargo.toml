@@ -12,6 +12,7 @@ name = "bouncer"
 actix-web = "4.3.0"
 clap = { version = "4.1.6", features = ["derive", "env"] }
 digest = { version = "0.10.6", features = ["mac"] }
+encoding_rs = "0.8.32"
 futures = "0.3.26"
 futures-util = "0.3.26"
 hex = "0.4.3"

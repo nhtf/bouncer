@@ -258,6 +258,7 @@ dependencies = [
  "actix-web",
  "clap",
  "digest",
+ "encoding_rs",
  "futures",
  "futures-util",
  "hex",
