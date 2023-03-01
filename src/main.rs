@@ -392,8 +392,8 @@ async fn embed(
     if mime.type_() != mime::TEXT && mime.subtype() != mime::HTML {
         return Err(ProxyError::BadContentType);
     }
-    let bytes: Vec<u8> = match state.max_length {
-        Some(max_length) => {
+    let bytes: Vec<u8> = match (state.max_length, resp.content_length()) {
+        (Some(max_length), None) => {
             let mut bytes = Vec::new();
             let mut stream = resp.bytes_stream();
             let mut length = 0;
@@ -407,7 +407,7 @@ async fn embed(
             }
             Ok::<Vec<u8>, ProxyError>(bytes.into_iter().flatten().collect())
         }
-        None => resp
+        _ => resp
             .bytes()
             .await
             .map(Vec::from)
