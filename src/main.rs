@@ -318,7 +318,7 @@ fn extract_metadata(data: &str, url: &str, secret: &str) -> Result<Metadata, Pro
             .or_else(|| metas.remove("twitter:title"))
             .or_else(|| metas.remove("title"))
             .map(|x| x.to_string())
-            .or_else(|| doc.select(&title_selector).nth(0).map(|x| x.text().collect())),
+            .or_else(|| doc.select(&title_selector).next().map(|x| x.text().collect())),
         description: metas
             .get("og:description")
             .or_else(|| metas.get("twitter:description"))
