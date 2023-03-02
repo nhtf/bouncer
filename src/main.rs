@@ -15,12 +15,12 @@ use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Sha256;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::Duration;
 use url::{Host, ParseError, Url};
 use validator::Validate;
-use std::borrow::Cow;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -50,7 +50,7 @@ struct Args {
     #[arg(
         short,
         long,
-        help = "Request timeout in millis. 0 for no timeout",
+        help = "Request timeout in milliseconds",
         env = "BOUNCER_TIMEOUT"
     )]
     timeout: Option<u64>,
@@ -93,6 +93,7 @@ enum ProxyError {
     InvalidScheme,
     MalformedMetadata,
     MalformedText,
+    Timeout,
     LabelMe,
 }
 
@@ -150,9 +151,8 @@ impl ResponseError for ProxyError {
             ProxyError::ContentTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             ProxyError::UnsupportedContentType => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             ProxyError::MalformedText => StatusCode::UNPROCESSABLE_ENTITY,
-            ProxyError::LabelMe => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            ProxyError::Timeout => StatusCode::GATEWAY_TIMEOUT,
+            ProxyError::LabelMe => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::BAD_REQUEST,
         }
     }
@@ -171,6 +171,7 @@ impl ResponseError for ProxyError {
             ProxyError::InvalidScheme => "Will only proxy http and https requests",
             ProxyError::MalformedMetadata => "Metadata is ill-formed",
             ProxyError::MalformedText => "Text was malformed",
+            ProxyError::Timeout => "Server took too long to respond",
             _ => "Internal server error",
         };
         HttpResponse::build(self.status_code())
@@ -263,6 +264,7 @@ async fn fetch(
     if contains(addr.ip(), state.blacklisted_networks.iter()) {
         return Err(ProxyError::ForbiddenProxy);
     }
+
     let headers = resp.headers();
     let content_type = headers
         .get(CONTENT_TYPE)
@@ -392,13 +394,14 @@ async fn embed(
     if mime.type_() != mime::TEXT && mime.subtype() != mime::HTML {
         return Err(ProxyError::BadContentType);
     }
+
     let bytes: Vec<u8> = match (state.max_length, resp.content_length()) {
         (Some(max_length), None) => {
             let mut bytes = Vec::new();
             let mut stream = resp.bytes_stream();
             let mut length = 0;
             while let Some(part) = stream.next().await {
-                let content = part.map_err(|_| ProxyError::LabelMe)?;
+                let content = part.map_err(|_| ProxyError::Timeout)?;
                 length += content.len();
                 bytes.push(content.into_iter());
                 if length > max_length {
@@ -411,14 +414,15 @@ async fn embed(
             .bytes()
             .await
             .map(Vec::from)
-            .map_err(|_| ProxyError::LabelMe),
+            .map_err(|_| ProxyError::Timeout),
     }?;
-    let encoding = Encoding::for_label(mime
-            .get_param("charset")
+    let encoding = Encoding::for_label(
+        mime.get_param("charset")
             .map(Into::into)
             .unwrap_or("utf-8")
-            .as_bytes()
-        ).unwrap_or(UTF_8);
+            .as_bytes(),
+    )
+    .unwrap_or(UTF_8);
     let (text, _, malformed) = encoding.decode(&bytes);
 
     if malformed {
@@ -430,11 +434,7 @@ async fn embed(
         Cow::Borrowed(s) => s,
     };
 
-    let metadata = extract_metadata(
-        text,
-        &query.url,
-        &state.secret,
-    )?;
+    let metadata = extract_metadata(text, &query.url, &state.secret)?;
 
     //TODO replace star with something more restrictive
     Ok(HttpResponse::Ok()
