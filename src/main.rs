@@ -39,6 +39,7 @@ struct Args {
     #[arg(short, long, env = "BOUNCER_MAXSIZE")]
     max_length: Option<usize>,
 
+    //TODO make this a vector like the headers argument
     #[arg(
         short,
         long = "blacklist",
@@ -288,8 +289,9 @@ fn extract_metadata(data: &str, url: &str, secret: &str) -> Result<Metadata, Pro
     let doc = Html::parse_document(data);
 
     let meta_selector = Selector::parse("meta").map_err(|_| ProxyError::LabelMe)?;
+    let title_selector = Selector::parse("title").map_err(|_| ProxyError::LabelMe)?;
     //let link_selector = Selector::parse("link").map_err(|_| ProxyError::LabelMe)?;
-    let metas: HashMap<&str, &str> = doc
+    let mut metas: HashMap<&str, &str> = doc
         .select(&meta_selector)
         .map(|elem| elem.value())
         .map(|value| {
@@ -312,10 +314,11 @@ fn extract_metadata(data: &str, url: &str, secret: &str) -> Result<Metadata, Pro
     let metadata = Metadata {
         url: url.to_string(),
         title: metas
-            .get("og:title")
-            .or_else(|| metas.get("twitter:title"))
-            .or_else(|| metas.get("title"))
-            .map(|x| x.to_string()), //TODO fallback to title
+            .remove("og:title")
+            .or_else(|| metas.remove("twitter:title"))
+            .or_else(|| metas.remove("title"))
+            .map(|x| x.to_string())
+            .or_else(|| doc.select(&title_selector).nth(0).map(|x| x.text().collect())),
         description: metas
             .get("og:description")
             .or_else(|| metas.get("twitter:description"))
