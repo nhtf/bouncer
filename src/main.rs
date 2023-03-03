@@ -502,7 +502,7 @@ async fn main() -> std::io::Result<()> {
         for header in &args.headers {
             default_headers = default_headers.add(
                 header
-                    .split_once('=')
+                    .split_once(':')
                     .expect("expected header in format: \"key:value\""),
             );
         }
