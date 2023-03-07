@@ -10,7 +10,7 @@ use hex::FromHexError;
 use hmac::{Hmac, Mac};
 use ipnetwork::IpNetwork;
 use mime::Mime;
-use reqwest::{header::ToStrError, header::CONTENT_TYPE, Client, Response};
+use reqwest::{header::ToStrError, header::CONTENT_TYPE, header::HeaderMap, Client, Response};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -78,6 +78,7 @@ struct AppState {
     secret: String,
     max_length: Option<usize>,
     blacklisted_networks: Vec<IpNetwork>,
+    copy_headers: Vec<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -228,6 +229,18 @@ where
         Some(Host::Ipv6(addr)) => check_addr(IpAddr::V6(addr), networks),
         None => Err(ProxyError::NoHost),
     }
+}
+
+fn copy_headers<'a, I>(headers: &HeaderMap, copy: I) -> Vec<(String, String)>
+where
+    I: Iterator<Item = &'a String>
+{
+    copy.filter_map(|key| {
+        match headers.get(key.as_str()).map(|key| key.to_str()) {
+            Some(Ok(value)) => Some((key.clone(), value.to_string())),
+            _ => None,
+        }
+    }).collect()
 }
 
 async fn fetch(
@@ -398,6 +411,8 @@ async fn embed(
         return Err(ProxyError::BadContentType);
     }
 
+    let copied_headers = copy_headers(resp.headers(), state.copy_headers.iter());
+
     let bytes: Vec<u8> = match (state.max_length, resp.content_length()) {
         (Some(max_length), None) => {
             let mut bytes = Vec::new();
@@ -440,9 +455,13 @@ async fn embed(
     let metadata = extract_metadata(text, &query.url, &state.secret)?;
 
     //TODO replace star with something more restrictive
-    Ok(HttpResponse::Ok()
-        .insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"))
-        .json(metadata))
+    let mut response = HttpResponse::Ok();
+    for pair in copied_headers {
+        response.insert_header(pair);
+    }
+    response.insert_header(header::ContentType(mime::APPLICATION_JSON));
+    response.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"));
+    Ok(response.json(metadata))
 }
 
 #[get("/{digest}/proxy")]
@@ -452,6 +471,16 @@ async fn proxy(
     query: web::Query<Parameters>,
 ) -> Result<impl Responder, ProxyError> {
     let (resp, mime) = fetch(&query.url, &path.into_inner(), &state).await?;
+
+
+    /*
+    let copied_headers: Vec<(String, String)> = state.copy_headers.iter().filter_map(|key| {
+        match resp.headers().get(key).map(|key| key.to_str()) {
+            Some(Ok(value)) => Some((key.clone(), value.to_string())),
+            _ => None,
+        }
+    }).collect();*/
+    let copied_headers = copy_headers(resp.headers(), state.copy_headers.iter());
 
     let mut length = 0;
     let stream = resp.bytes_stream().take_while(move |part| {
@@ -467,9 +496,13 @@ async fn proxy(
     });
 
     match mime.type_() {
-        mime::IMAGE | mime::VIDEO => Ok(HttpResponse::Ok()
-            .insert_header(header::ContentType(mime))
-            .streaming(stream)),
+        mime::IMAGE | mime::VIDEO => {
+            let mut response = HttpResponse::Ok();
+            for pair in copied_headers {
+                response.insert_header(pair);
+            }
+            Ok(response.streaming(stream))
+        }
         _ => Err(ProxyError::UnsupportedContentType),
     }
 }
@@ -499,12 +532,16 @@ async fn main() -> std::io::Result<()> {
         }
         let mut default_headers =
             middleware::DefaultHeaders::new().add((header::X_CONTENT_TYPE_OPTIONS, "nosniff"));
+        let mut copy_headers = Vec::new();
         for header in &args.headers {
-            default_headers = default_headers.add(
-                header
-                    .split_once(':')
-                    .expect("expected header in format: \"key:value\""),
-            );
+            match header.split_once(':') {
+                Some(pair) => { 
+                    default_headers = default_headers.add(pair);
+                },
+                None => {
+                    copy_headers.push(header.to_string());
+                },
+            };
         }
 
         App::new()
@@ -517,6 +554,7 @@ async fn main() -> std::io::Result<()> {
                     .split(';')
                     .map(|network| network.trim().parse().expect("Expected valid CIDR network"))
                     .collect(),
+                copy_headers,
             }))
             .wrap(default_headers)
             .service(proxy)
