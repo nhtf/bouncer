@@ -1,6 +1,6 @@
 use actix_web::http::StatusCode;
 use actix_web::{
-    get, http::header, middleware, web, App, HttpResponse, HttpServer, Responder, ResponseError,
+    http::header, middleware, web, App, HttpResponse, HttpServer, Responder, ResponseError,
 };
 use clap::Parser;
 use digest::MacError;
@@ -71,6 +71,20 @@ struct Args {
         help = "Add additional headers to all responses. Can be used multiple times"
     )]
     headers: Vec<String>,
+
+    #[arg(
+        short = 'P',
+        long = "proxyheader",
+        help = "Add additional headers to only the proxy route. Can be used multiple times"
+    )]
+    proxy_headers: Vec<String>,
+
+    #[arg(
+        short = 'E',
+        long = "embedheader",
+        help = "Add additional headers to only the embed route. Can be used multiple times"
+    )]
+    embed_headers: Vec<String>,
 }
 
 struct AppState {
@@ -78,7 +92,8 @@ struct AppState {
     secret: String,
     max_length: Option<usize>,
     blacklisted_networks: Vec<IpNetwork>,
-    copy_headers: Vec<String>,
+    proxy_copy_headers: Vec<String>,
+    embed_copy_headers: Vec<String>,
 }
 
 #[derive(Serialize, Debug)]
@@ -399,7 +414,6 @@ fn extract_metadata(data: &str, url: &str, secret: &str) -> Result<Metadata, Pro
     Ok(metadata)
 }
 
-#[get("/{digest}/embed")]
 async fn embed(
     state: web::Data<AppState>,
     path: web::Path<String>,
@@ -411,7 +425,7 @@ async fn embed(
         return Err(ProxyError::BadContentType);
     }
 
-    let copied_headers = copy_headers(resp.headers(), state.copy_headers.iter());
+    let copied_headers = copy_headers(resp.headers(), state.embed_copy_headers.iter());
 
     let bytes: Vec<u8> = match (state.max_length, resp.content_length()) {
         (Some(max_length), None) => {
@@ -454,17 +468,15 @@ async fn embed(
 
     let metadata = extract_metadata(text, &query.url, &state.secret)?;
 
-    //TODO replace star with something more restrictive
     let mut response = HttpResponse::Ok();
     for pair in copied_headers {
         response.insert_header(pair);
     }
     response.insert_header(header::ContentType(mime::APPLICATION_JSON));
-    response.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"));
+    /*response.insert_header((header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"));*/
     Ok(response.json(metadata))
 }
 
-#[get("/{digest}/proxy")]
 async fn proxy(
     state: web::Data<AppState>,
     path: web::Path<String>,
@@ -472,15 +484,7 @@ async fn proxy(
 ) -> Result<impl Responder, ProxyError> {
     let (resp, mime) = fetch(&query.url, &path.into_inner(), &state).await?;
 
-
-    /*
-    let copied_headers: Vec<(String, String)> = state.copy_headers.iter().filter_map(|key| {
-        match resp.headers().get(key).map(|key| key.to_str()) {
-            Some(Ok(value)) => Some((key.clone(), value.to_string())),
-            _ => None,
-        }
-    }).collect();*/
-    let copied_headers = copy_headers(resp.headers(), state.copy_headers.iter());
+    let copied_headers = copy_headers(resp.headers(), state.proxy_copy_headers.iter());
 
     let mut length = 0;
     let stream = resp.bytes_stream().take_while(move |part| {
@@ -507,6 +511,24 @@ async fn proxy(
     }
 }
 
+fn get_headers<'a, I>(headers: I) -> (middleware::DefaultHeaders, Vec<String>)
+where I: Iterator<Item = &'a String> {
+    let mut default_headers = middleware::DefaultHeaders::new();
+    let mut copy_headers = Vec::new();
+
+    for item in headers {
+        match item.split_once(':') {
+            Some(pair) => {
+                default_headers = default_headers.add(pair);
+            },
+            None => {
+                copy_headers.push(item.to_string());
+            },
+        }
+    }
+    (default_headers, copy_headers)
+}
+
 //TODO
 //Add config and command line options for the following
 //  Allowed mime types
@@ -530,19 +552,8 @@ async fn main() -> std::io::Result<()> {
         if let Some(timeout) = args.timeout {
             builder = builder.timeout(Duration::from_millis(timeout));
         }
-        let mut default_headers =
-            middleware::DefaultHeaders::new().add((header::X_CONTENT_TYPE_OPTIONS, "nosniff"));
-        let mut copy_headers = Vec::new();
-        for header in &args.headers {
-            match header.split_once(':') {
-                Some(pair) => { 
-                    default_headers = default_headers.add(pair);
-                },
-                None => {
-                    copy_headers.push(header.to_string());
-                },
-            };
-        }
+        let (proxy_default_headers, proxy_copy_headers) = get_headers(args.headers.iter().chain(args.proxy_headers.iter()));
+        let (embed_default_headers, embed_copy_headers) = get_headers(args.headers.iter().chain(args.embed_headers.iter()));
 
         App::new()
             .app_data(web::Data::new(AppState {
@@ -554,11 +565,11 @@ async fn main() -> std::io::Result<()> {
                     .split(';')
                     .map(|network| network.trim().parse().expect("Expected valid CIDR network"))
                     .collect(),
-                copy_headers,
+                proxy_copy_headers,
+                embed_copy_headers,
             }))
-            .wrap(default_headers)
-            .service(proxy)
-            .service(embed)
+            .service(web::resource("{digest}/proxy").route(web::get().to(proxy)).wrap(proxy_default_headers))
+            .service(web::resource("{digest}/embed").route(web::get().to(embed)).wrap(embed_default_headers))
     })
     .bind((args.listen, args.port))?
     .run()
