@@ -1,2 +1,4 @@
 /target
 tags
+*.py
+config.toml

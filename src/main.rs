@@ -1,6 +1,6 @@
 use actix_web::http::StatusCode;
 use actix_web::{
-    http::header, middleware, web, App, HttpResponse, HttpServer, Responder, ResponseError,
+    http::header, middleware, web, App, HttpResponse, HttpServer, Responder, ResponseError, HttpResponseBuilder,
 };
 use clap::Parser;
 use digest::MacError;
@@ -22,6 +22,7 @@ use std::net::IpAddr;
 use std::time::Duration;
 use url::{Host, ParseError, Url};
 use validator::Validate;
+use pretty_env_logger;
 
 mod settings;
 use settings::Settings;
@@ -84,28 +85,24 @@ struct Args {
     headers: Vec<String>,
 
     #[arg(
-        short = 'p',
         long = "proxy-header",
         help = "Add additional default headers to only the proxy route. Can be used multiple times"
     )]
     proxy_headers: Vec<String>,
 
     #[arg(
-        short = 'P',
         long = "proxy-header-copy",
         help = "Add additional headers to copy only the proxy route. Can be used multiple times"
     )]
     copy_proxy_headers: Vec<String>,
 
     #[arg(
-        short = 'e',
         long = "embed-header",
         help = "Add additional default headers to only the embed route. Can be used multiple times"
     )]
     embed_headers: Vec<String>,
 
     #[arg(
-        short = 'E',
         long = "embed-header-copy",
         help = "Add additional headers to copy only the embed route. Can be used multiple times"
     )]
@@ -118,9 +115,7 @@ struct AppState {
     secret: String,
     max_length: Option<usize>,
     blacklisted_networks: Vec<IpNetwork>,
-    proxy_headers: Vec<(String, String)>,
     proxy_copy_headers: Vec<String>,
-    embed_headers: Vec<(String, String)>,
     embed_copy_headers: Vec<String>,
 }
 
@@ -570,7 +565,7 @@ where
     (default_headers, copy_headers)
 }*/
 
-fn build_state(args: &Args) -> Result<(AppState, (String, u16)), SetupError> {
+fn build_state(args: &Args) -> Result<(AppState, (String, u16), Vec<(String, String)>, Vec<(String, String)>), SetupError> {
     let config = args
         .config
         .as_ref()
@@ -676,14 +671,6 @@ fn build_state(args: &Args) -> Result<(AppState, (String, u16)), SetupError> {
                 .into_iter(),
         )
         .collect();
-
-    let mut builder = Client::builder();
-    match timeout {
-        Some(timeout) => {
-            builder = builder.timeout(Duration::from_millis(timeout));
-        }
-        None => (),
-    }
     let embed_headers = args
         .embed_headers
         .iter()
@@ -731,27 +718,43 @@ fn build_state(args: &Args) -> Result<(AppState, (String, u16)), SetupError> {
         )
         .collect();
 
+    let mut builder = Client::builder();
+    match timeout {
+        Some(timeout) => {
+            builder = builder.timeout(Duration::from_millis(timeout));
+        }
+        None => (),
+    }
+
     Ok((
         AppState {
             client: builder.build().expect("Reqwest client"),
             secret,
             max_length,
             blacklisted_networks,
-            proxy_headers,
             proxy_copy_headers,
-            embed_headers,
             embed_copy_headers,
         },
         (address, port),
+        proxy_headers,
+        embed_headers,
     ))
 }
 
-async fn start(state: AppState, listen: (String, u16)) -> std::io::Result<()> {
+async fn start(state: AppState, listen: (String, u16), proxy_headers: Vec<(String, String)>, embed_headers: Vec<(String, String)>) -> std::io::Result<()> {
     HttpServer::new(move || {
+        let mut proxy_middleware = middleware::DefaultHeaders::new();
+        for header in &proxy_headers {
+            proxy_middleware = proxy_middleware.add(header.clone());
+        }
+        let mut embed_middleware = middleware::DefaultHeaders::new();
+        for header in &embed_headers {
+            embed_middleware = embed_middleware.add(header.clone());
+        }
         App::new()
             .app_data(web::Data::new(state.clone()))
-            .service(web::resource("{digest}/proxy").route(web::get().to(proxy)))
-            .service(web::resource("{digest}/embed").route(web::get().to(embed)))
+            .service(web::resource("{digest}/proxy").route(web::get().to(proxy)).wrap(proxy_middleware))
+            .service(web::resource("{digest}/embed").route(web::get().to(embed)).wrap(embed_middleware))
     })
     .bind(listen)?
     .run()
@@ -772,13 +775,14 @@ async fn start(state: AppState, listen: (String, u16)) -> std::io::Result<()> {
 //Better logging of errors
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    pretty_env_logger::init();
     let args = Args::parse();
     let state = build_state(&args);
 
     match state {
-        Ok((state, listen)) => {
+        Ok((state, listen, proxy, embed)) => {
             log::info!("listening on {}:{}", listen.0, listen.1);
-            start(state, listen).await
+            start(state, listen, proxy, embed).await
         }
         Err(_) => {
             log::error!("something wrong with settings");
