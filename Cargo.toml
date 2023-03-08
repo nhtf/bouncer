@@ -11,6 +11,7 @@ name = "bouncer"
 [dependencies]
 actix-web = "4.3.0"
 clap = { version = "4.1.6", features = ["derive", "env"] }
+config = "0.13.3"
 digest = { version = "0.10.6", features = ["mac"] }
 encoding_rs = "0.8.32"
 futures = "0.3.26"
@@ -18,6 +19,7 @@ futures-util = "0.3.26"
 hex = "0.4.3"
 hmac = "0.12.1"
 ipnetwork = "0.20.0"
+log = "0.4.17"
 mime = "0.3.16"
 reqwest = { version = "0.11.14", features = ["stream"] }
 scraper = "0.14.0"

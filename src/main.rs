@@ -9,8 +9,9 @@ use futures::{future, stream::StreamExt};
 use hex::FromHexError;
 use hmac::{Hmac, Mac};
 use ipnetwork::IpNetwork;
+use log;
 use mime::Mime;
-use reqwest::{header::ToStrError, header::CONTENT_TYPE, header::HeaderMap, Client, Response};
+use reqwest::{header::HeaderMap, header::ToStrError, header::CONTENT_TYPE, Client, Response};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -22,31 +23,32 @@ use std::time::Duration;
 use url::{Host, ParseError, Url};
 use validator::Validate;
 
+mod settings;
+use settings::Settings;
+
 type HmacSha256 = Hmac<Sha256>;
+
+const DEFAULT_PORT: u16 = 8080u16;
+const DEFAULT_ADDRESS: &str = "localhost";
+const DEFAULT_AGENT: &str = "Bouncer/0.1.0";
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     #[arg(short, long, help = "HMAC key", env = "BOUNCER_KEY")]
-    key: String,
+    key: Option<String>,
 
-    #[arg(short, long, default_value = "0.0.0.0", env = "BOUNCER_LISTEN")]
-    listen: String,
+    #[arg(short, long, help = format!("Address to listen to. Will default to {}", DEFAULT_ADDRESS), env = "BOUNCER_LISTEN")]
+    address: Option<String>,
 
-    #[arg(short, long, default_value_t = 8080u16, env = "BOUNCER_PORT")]
-    port: u16,
+    #[arg(short, long, help = format!("Port to listen to. Will default to {}", DEFAULT_PORT), env = "BOUNCER_PORT")]
+    port: Option<u16>,
+
+    #[arg(short, long, help = "Specify config file", env = "BOUNCER_CONFIG")]
+    config: Option<String>,
 
     #[arg(short, long, env = "BOUNCER_MAXSIZE")]
     max_length: Option<usize>,
-
-    //TODO make this a vector like the headers argument
-    #[arg(
-        short,
-        long = "blacklist",
-        default_value = "127.0.0.0/8;169.254.0.0/16;10.0.0.0/8;172.16.0.0/12;::1/128;fe80::/10;fec0::/10;fc00::/7;::ffff:0:0/96",
-        env = "BOUNCER_BLACKLIST"
-    )]
-    blacklisted_networks: String,
 
     #[arg(
         short,
@@ -55,6 +57,15 @@ struct Args {
         env = "BOUNCER_TIMEOUT"
     )]
     timeout: Option<u64>,
+
+    //TODO make this a vector like the headers argument
+    #[arg(
+        short,
+        long = "blacklist",
+        //default_value = "127.0.0.0/8;169.254.0.0/16;10.0.0.0/8;172.16.0.0/12;::1/128;fe80::/10;fec0::/10;fc00::/7;::ffff:0:0/96",
+        env = "BOUNCER_BLACKLIST"
+    )]
+    blacklisted_networks: Vec<String>,
 
     #[arg(
         short,
@@ -73,26 +84,43 @@ struct Args {
     headers: Vec<String>,
 
     #[arg(
-        short = 'P',
-        long = "proxyheader",
-        help = "Add additional headers to only the proxy route. Can be used multiple times"
+        short = 'p',
+        long = "proxy-header",
+        help = "Add additional default headers to only the proxy route. Can be used multiple times"
     )]
     proxy_headers: Vec<String>,
 
     #[arg(
-        short = 'E',
-        long = "embedheader",
-        help = "Add additional headers to only the embed route. Can be used multiple times"
+        short = 'P',
+        long = "proxy-header-copy",
+        help = "Add additional headers to copy only the proxy route. Can be used multiple times"
+    )]
+    copy_proxy_headers: Vec<String>,
+
+    #[arg(
+        short = 'e',
+        long = "embed-header",
+        help = "Add additional default headers to only the embed route. Can be used multiple times"
     )]
     embed_headers: Vec<String>,
+
+    #[arg(
+        short = 'E',
+        long = "embed-header-copy",
+        help = "Add additional headers to copy only the embed route. Can be used multiple times"
+    )]
+    copy_embed_headers: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
 struct AppState {
     client: Client,
     secret: String,
     max_length: Option<usize>,
     blacklisted_networks: Vec<IpNetwork>,
+    proxy_headers: Vec<(String, String)>,
     proxy_copy_headers: Vec<String>,
+    embed_headers: Vec<(String, String)>,
     embed_copy_headers: Vec<String>,
 }
 
@@ -112,6 +140,11 @@ enum ProxyError {
     MalformedText,
     Timeout,
     LabelMe,
+}
+
+#[derive(Debug)]
+enum SetupError {
+    MissingKey,
 }
 
 #[derive(Validate, Deserialize)]
@@ -248,14 +281,15 @@ where
 
 fn copy_headers<'a, I>(headers: &HeaderMap, copy: I) -> Vec<(String, String)>
 where
-    I: Iterator<Item = &'a String>
+    I: Iterator<Item = &'a String>,
 {
-    copy.filter_map(|key| {
-        match headers.get(key.as_str()).map(|key| key.to_str()) {
+    copy.filter_map(
+        |key| match headers.get(key.as_str()).map(|key| key.to_str()) {
             Some(Ok(value)) => Some((key.clone(), value.to_string())),
             _ => None,
-        }
-    }).collect()
+        },
+    )
+    .collect()
 }
 
 async fn fetch(
@@ -346,7 +380,11 @@ fn extract_metadata(data: &str, url: &str, secret: &str) -> Result<Metadata, Pro
             .or_else(|| metas.remove("twitter:title"))
             .or_else(|| metas.remove("title"))
             .map(|x| x.to_string())
-            .or_else(|| doc.select(&title_selector).next().map(|x| x.text().collect())),
+            .or_else(|| {
+                doc.select(&title_selector)
+                    .next()
+                    .map(|x| x.text().collect())
+            }),
         description: metas
             .get("og:description")
             .or_else(|| metas.get("twitter:description"))
@@ -511,8 +549,11 @@ async fn proxy(
     }
 }
 
+/*
 fn get_headers<'a, I>(headers: I) -> (middleware::DefaultHeaders, Vec<String>)
-where I: Iterator<Item = &'a String> {
+where
+    I: Iterator<Item = &'a String>,
+{
     let mut default_headers = middleware::DefaultHeaders::new();
     let mut copy_headers = Vec::new();
 
@@ -520,13 +561,201 @@ where I: Iterator<Item = &'a String> {
         match item.split_once(':') {
             Some(pair) => {
                 default_headers = default_headers.add(pair);
-            },
+            }
             None => {
                 copy_headers.push(item.to_string());
-            },
+            }
         }
     }
     (default_headers, copy_headers)
+}*/
+
+fn build_state(args: &Args) -> Result<(AppState, (String, u16)), SetupError> {
+    let config = args
+        .config
+        .as_ref()
+        .map(|file| Settings::new(file).expect("file"));
+    let secret = args
+        .key
+        .as_ref()
+        .map(Clone::clone)
+        .or_else(|| config.as_ref().and_then(|config| config.key.clone()))
+        .ok_or(SetupError::MissingKey)?;
+    let address = args
+        .address
+        .as_ref()
+        .map(Clone::clone)
+        .or_else(|| config.as_ref().and_then(|config| config.address.clone()))
+        .unwrap_or_else(|| {
+            log::info!(
+                "defaulting to {} as address due to none specified",
+                DEFAULT_ADDRESS
+            );
+            DEFAULT_ADDRESS.to_string()
+        });
+    let port = args
+        .port
+        .as_ref()
+        .map(Clone::clone)
+        .or_else(|| config.as_ref().and_then(|config| config.port))
+        .unwrap_or_else(|| {
+            log::info!(
+                "defaulting to {} as port due to none specified",
+                DEFAULT_PORT
+            );
+            DEFAULT_PORT
+        });
+    let max_length = args
+        .max_length
+        .or_else(|| config.as_ref().and_then(|config| config.max_length));
+    let timeout = args
+        .timeout
+        .or_else(|| config.as_ref().and_then(|config| config.timeout));
+
+    let blacklisted_networks = args
+        .blacklisted_networks
+        .iter()
+        .map(Clone::clone)
+        .chain(
+            config
+                .as_ref()
+                .and_then(|config| {
+                    config
+                        .blacklist
+                        .as_ref()
+                        .and_then(|blacklist| Some(blacklist.clone()))
+                })
+                .unwrap_or_default()
+                .into_iter(),
+        )
+        .map(|network| network.trim().parse().expect("Valid CIDR network"))
+        .collect();
+    let proxy_headers = args
+        .proxy_headers
+        .iter()
+        .map(Clone::clone)
+        .chain(
+            config
+                .as_ref()
+                .and_then(|config| {
+                    config
+                        .proxy
+                        .default_headers
+                        .as_ref()
+                        .and_then(|elems| Some(elems.clone()))
+                })
+                .unwrap_or_default()
+                .into_iter(),
+        )
+        .filter_map(|val| match val.split_once(':') {
+            Some((a, b)) => Some((a.to_string(), b.to_string())),
+            None => {
+                log::warn!(
+                    "ignoring header \"{}\" because it doesn't have a value",
+                    val
+                );
+                None
+            }
+        })
+        .collect();
+    let proxy_copy_headers = args
+        .copy_proxy_headers
+        .iter()
+        .map(Clone::clone)
+        .chain(
+            config
+                .as_ref()
+                .and_then(|config| {
+                    config
+                        .proxy
+                        .copy_headers
+                        .as_ref()
+                        .and_then(|elems| Some(elems.clone()))
+                })
+                .unwrap_or_default()
+                .into_iter(),
+        )
+        .collect();
+
+    let mut builder = Client::builder();
+    match timeout {
+        Some(timeout) => {
+            builder = builder.timeout(Duration::from_millis(timeout));
+        }
+        None => (),
+    }
+    let embed_headers = args
+        .embed_headers
+        .iter()
+        .map(Clone::clone)
+        .chain(
+            config
+                .as_ref()
+                .and_then(|config| {
+                    config
+                        .embed
+                        .default_headers
+                        .as_ref()
+                        .and_then(|elems| Some(elems.clone()))
+                })
+                .unwrap_or_default()
+                .into_iter(),
+        )
+        .filter_map(|val| match val.split_once(':') {
+            Some((a, b)) => Some((a.to_string(), b.to_string())),
+            None => {
+                log::warn!(
+                    "ignoring header \"{}\" because it doesn't have a value",
+                    val
+                );
+                None
+            }
+        })
+        .collect();
+    let embed_copy_headers = args
+        .copy_embed_headers
+        .iter()
+        .map(Clone::clone)
+        .chain(
+            config
+                .as_ref()
+                .and_then(|config| {
+                    config
+                        .embed
+                        .copy_headers
+                        .as_ref()
+                        .and_then(|elems| Some(elems.clone()))
+                })
+                .unwrap_or_default()
+                .into_iter(),
+        )
+        .collect();
+
+    Ok((
+        AppState {
+            client: builder.build().expect("Reqwest client"),
+            secret,
+            max_length,
+            blacklisted_networks,
+            proxy_headers,
+            proxy_copy_headers,
+            embed_headers,
+            embed_copy_headers,
+        },
+        (address, port),
+    ))
+}
+
+async fn start(state: AppState, listen: (String, u16)) -> std::io::Result<()> {
+    HttpServer::new(move || {
+        App::new()
+            .app_data(web::Data::new(state.clone()))
+            .service(web::resource("{digest}/proxy").route(web::get().to(proxy)))
+            .service(web::resource("{digest}/embed").route(web::get().to(embed)))
+    })
+    .bind(listen)?
+    .run()
+    .await
 }
 
 //TODO
@@ -544,9 +773,22 @@ where I: Iterator<Item = &'a String> {
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let args = Args::parse();
+    let state = build_state(&args);
 
-    println!("Starting bouncer on: {}:{}", args.listen, args.port);
+    match state {
+        Ok((state, listen)) => {
+            log::info!("listening on {}:{}", listen.0, listen.1);
+            start(state, listen).await
+        }
+        Err(_) => {
+            log::error!("something wrong with settings");
+            Ok(())
+        }
+    }
 
+    //println!("Starting bouncer on: {}:{}", args.address.unwrap(), args.port.unwrap());
+
+    /*
     HttpServer::new(move || {
         let mut builder = Client::builder().user_agent(args.user_agent.clone());
         if let Some(timeout) = args.timeout {
@@ -554,15 +796,16 @@ async fn main() -> std::io::Result<()> {
         }
         let (proxy_default_headers, proxy_copy_headers) = get_headers(args.headers.iter().chain(args.proxy_headers.iter()));
         let (embed_default_headers, embed_copy_headers) = get_headers(args.headers.iter().chain(args.embed_headers.iter()));
+        let tmp = build_state(&args).unwrap();
 
         App::new()
             .app_data(web::Data::new(AppState {
                 client: builder.build().expect("Reqwest client"),
-                secret: args.key.clone(),
+                secret: tmp.secret.clone(),
                 max_length: args.max_length,
                 blacklisted_networks: args
                     .blacklisted_networks
-                    .split(';')
+                    .iter()
                     .map(|network| network.trim().parse().expect("Expected valid CIDR network"))
                     .collect(),
                 proxy_copy_headers,
@@ -571,7 +814,7 @@ async fn main() -> std::io::Result<()> {
             .service(web::resource("{digest}/proxy").route(web::get().to(proxy)).wrap(proxy_default_headers))
             .service(web::resource("{digest}/embed").route(web::get().to(embed)).wrap(embed_default_headers))
     })
-    .bind((args.listen, args.port))?
+    .bind((args.address.unwrap(), args.port.unwrap()))?
     .run()
-    .await
+    .await*/
 }
